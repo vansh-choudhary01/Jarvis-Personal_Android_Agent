@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type {ContentBlockParam, MessageParam} from '@anthropic-ai/sdk/resources/messages';
+import {GoogleGenAI} from '@google/genai';
 import {agentActionSchema, type AgentAction, type ScreenState} from './protocol.js';
 
 export interface HistoryStep {
@@ -48,10 +49,16 @@ function parseJsonObject(text: string): unknown {
 }
 
 export class AndroidAgent {
-  private readonly anthropic: Anthropic;
+  private readonly anthropic: Anthropic | null;
+  private readonly gemini: GoogleGenAI | null;
 
-  constructor(apiKey: string) {
-    this.anthropic = new Anthropic({apiKey});
+  constructor(
+    private readonly provider: 'anthropic' | 'gemini',
+    apiKey: string,
+    private readonly model: string,
+  ) {
+    this.anthropic = provider === 'anthropic' ? new Anthropic({apiKey}) : null;
+    this.gemini = provider === 'gemini' ? new GoogleGenAI({apiKey}) : null;
   }
 
   async nextAction(
@@ -88,18 +95,44 @@ export class AndroidAgent {
       });
     }
 
-    const messages: MessageParam[] = [{role: 'user', content}];
-    const response = await this.anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 512,
-      temperature: 0,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
-    const text = response.content
-      .filter(block => block.type === 'text')
-      .map(block => block.text)
-      .join('');
+    let text: string;
+    if (this.provider === 'anthropic') {
+      const messages: MessageParam[] = [{role: 'user', content}];
+      const response = await this.anthropic!.messages.create({
+        model: this.model,
+        max_tokens: 512,
+        temperature: 0,
+        system: SYSTEM_PROMPT,
+        messages,
+      });
+      text = response.content
+        .filter(block => block.type === 'text')
+        .map(block => block.text)
+        .join('');
+    } else {
+      const parts: Array<{text: string} | {inlineData: {mimeType: string; data: string}}> = [
+        {text: content[0]!.type === 'text' ? content[0]!.text : ''},
+      ];
+      if (screen.screenshotBase64) {
+        parts.push({
+          inlineData: {
+            mimeType: screen.screenshotMediaType ?? 'image/png',
+            data: screen.screenshotBase64,
+          },
+        });
+      }
+      const response = await this.gemini!.models.generateContent({
+        model: this.model,
+        contents: [{role: 'user', parts}],
+        config: {
+          systemInstruction: SYSTEM_PROMPT,
+          maxOutputTokens: 512,
+          temperature: 0,
+          responseMimeType: 'application/json',
+        },
+      });
+      text = response.text ?? '';
+    }
 
     return agentActionSchema.parse(parseJsonObject(text));
   }

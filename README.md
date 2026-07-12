@@ -40,7 +40,7 @@ The WebSocket and action loop run natively in `JarvisForegroundService.kt`. They
 
 - Windows, macOS, or Linux for the brain
 - Node.js 22+
-- Anthropic API key with access to `claude-sonnet-4-6`
+- An Anthropic API key or a Google Gemini API key
 - Java 21
 - Android Studio and Android SDK Platform 36
 - Android Build Tools 36.0.0, Platform Tools, CMake 3.22.1, and NDK `27.1.12297006`
@@ -59,10 +59,26 @@ npm.cmd start
 Set these values in `brain/.env`:
 
 ```env
+AI_PROVIDER=anthropic
 ANTHROPIC_API_KEY=your-anthropic-key
+ANTHROPIC_MODEL=claude-sonnet-4-6
+GEMINI_API_KEY=your-gemini-key
+GEMINI_MODEL=gemini-2.5-flash
 PHONE_AUTH_TOKEN=generate-a-long-random-secret
 PORT=3000
 ```
+
+Choose the active model provider with `AI_PROVIDER`:
+
+```env
+# Claude
+AI_PROVIDER=anthropic
+
+# Gemini
+AI_PROVIDER=gemini
+```
+
+Only the API key for the selected provider is required. Provider keys stay in the server-side `.env` and are never placed in the Android app. `/health` reports the active `provider` and `model`.
 
 Never commit `.env`. The brain exposes:
 
@@ -161,7 +177,7 @@ WhatsApp history is notification-based: Jarvis can report notifications captured
 
 ## Privacy and safety
 
-Jarvis sends task text, recent action history, relevant passive phone events, and the current Accessibility tree to Anthropic. This data can contain private screen text, contact names, phone numbers, and notification content. Screenshots are sent only if the phone supplies one.
+Jarvis sends task text, recent action history, relevant passive phone events, and the current Accessibility tree to whichever AI provider you select: Anthropic or Google Gemini. This data can contain private screen text, contact names, phone numbers, and notification content. Screenshots are sent only if the phone supplies one.
 
 - Use only on a phone you own and control.
 - Protect the API key, phone token, TLS keys, logs, and server.
@@ -183,4 +199,3 @@ The included `brain/deploy/jarvis-brain.service` expects the built brain at `/op
 - `mobile/android/.../JarvisNotificationListenerService.kt` — notification forwarding
 - `mobile/android/.../TelephonyModule.kt` — call, SMS, and call-log bridge
 - `mobile/App.tsx` — permission onboarding and connection status
-

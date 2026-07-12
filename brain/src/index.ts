@@ -7,14 +7,18 @@ import {phoneMessageSchema} from './protocol.js';
 import {TaskManager} from './taskManager.js';
 
 const port = Number(process.env.PORT ?? 3000);
-const apiKey = process.env.ANTHROPIC_API_KEY;
+const provider = process.env.AI_PROVIDER === 'gemini' ? 'gemini' : 'anthropic';
+const apiKey = provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.ANTHROPIC_API_KEY;
+const model = provider === 'gemini'
+  ? process.env.GEMINI_MODEL ?? 'gemini-2.5-flash'
+  : process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6';
 const authToken = process.env.PHONE_AUTH_TOKEN;
 
 if (!apiKey || !authToken) {
-  throw new Error('ANTHROPIC_API_KEY and PHONE_AUTH_TOKEN are required');
+  throw new Error(`${provider === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'} and PHONE_AUTH_TOKEN are required`);
 }
 
-const manager = new TaskManager(new AndroidAgent(apiKey));
+const manager = new TaskManager(new AndroidAgent(provider, apiKey, model));
 
 function bearerToken(value: string | undefined): string | null {
   const match = value?.match(/^Bearer\s+(.+)$/i);
@@ -33,7 +37,13 @@ function sendJson(response: import('node:http').ServerResponse, status: number, 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
   if (request.method === 'GET' && url.pathname === '/health') {
-    sendJson(response, 200, {ok: true, phoneConnected: manager.hasPhone(), activeTask: manager.getTask()?.id ?? null});
+    sendJson(response, 200, {
+      ok: true,
+      provider,
+      model,
+      phoneConnected: manager.hasPhone(),
+      activeTask: manager.getTask()?.id ?? null,
+    });
     return;
   }
   if (request.method !== 'POST' || url.pathname !== '/task') {
@@ -97,5 +107,5 @@ webSockets.on('connection', phone => {
 });
 
 server.listen(port, '0.0.0.0', () => {
-  console.log(`Jarvis brain listening on http://0.0.0.0:${port}`);
+  console.log(`Jarvis brain listening on http://0.0.0.0:${port} using ${provider}/${model}`);
 });

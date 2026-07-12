@@ -8,12 +8,13 @@ import {
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
 import {isJarvisConfigured, JARVIS_CONFIG} from './src/config';
-import {JarvisController} from './src/JarvisController';
-import {JarvisDevice, type PermissionStatus} from './src/native';
+import {JarvisController, type LogEntry} from './src/JarvisController';
+import {JarvisAccessibility, JarvisDevice, type PermissionStatus} from './src/native';
 
 const emptyStatus: PermissionStatus = {
   accessibility: false,
@@ -26,15 +27,34 @@ const emptyStatus: PermissionStatus = {
 };
 
 function App(): React.JSX.Element {
+  const [devMode, setDevMode] = useState(false);
+  const tapCount = useRef(0);
+  const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const onTitlePress = () => {
+    tapCount.current += 1;
+    if (tapTimer.current) clearTimeout(tapTimer.current);
+    tapTimer.current = setTimeout(() => { tapCount.current = 0; }, 800);
+    if (tapCount.current >= 3) {
+      tapCount.current = 0;
+      setDevMode(v => !v);
+    }
+  };
+
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="dark-content" backgroundColor="#F4F1EA" />
-      <Onboarding />
+      <Onboarding devMode={devMode} onTitlePress={onTitlePress} />
     </SafeAreaProvider>
   );
 }
 
-function Onboarding(): React.JSX.Element {
+interface OnboardingProps {
+  devMode: boolean;
+  onTitlePress: () => void;
+}
+
+function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element {
   const [permissions, setPermissions] = useState<PermissionStatus>(emptyStatus);
   const [connection, setConnection] = useState('Not started');
   const started = useRef(false);
@@ -89,7 +109,14 @@ function Onboarding(): React.JSX.Element {
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.eyebrow}>PERSONAL ANDROID AGENT</Text>
-        <Text style={styles.title}>Jarvis</Text>
+        <Pressable onPress={onTitlePress}>
+          <Text style={styles.title}>Jarvis</Text>
+        </Pressable>
+        {devMode && (
+          <View style={styles.devBadge}>
+            <Text style={styles.devBadgeText}>DEV MODE</Text>
+          </View>
+        )}
         <Text style={styles.intro}>
           Complete each one-time Android permission. Jarvis connects automatically when every item is ready.
         </Text>
@@ -148,10 +175,138 @@ function Onboarding(): React.JSX.Element {
         <Text style={styles.note}>
           Jarvis cannot read FLAG_SECURE screens, unlock the phone, or complete biometric/PIN prompts. The ongoing notification is required by Android.
         </Text>
+
+        {devMode && <DevScreen connection={connection} permissions={permissions} />}
       </ScrollView>
     </SafeAreaView>
   );
 }
+
+// ─── Dev Screen ──────────────────────────────────────────────────────────────
+
+function DevScreen({connection, permissions}: {connection: string; permissions: PermissionStatus}): React.JSX.Element {
+  const [instruction, setInstruction] = useState('');
+  const [submitResult, setSubmitResult] = useState('');
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const [nodeTree, setNodeTree] = useState('');
+  const [nodeExpanded, setNodeExpanded] = useState(false);
+
+  useEffect(() => JarvisController.subscribeLog(setLog), []);
+
+  const refreshNodeTree = async () => {
+    try {
+      const raw = await JarvisAccessibility.getCurrentNodeTree();
+      setNodeTree(raw);
+    } catch (e) {
+      setNodeTree(`Error: ${String(e)}`);
+    }
+  };
+
+  const submitTask = async () => {
+    if (!instruction.trim()) return;
+    setSubmitResult('Sending…');
+    try {
+      const res = await fetch(`${JARVIS_CONFIG.brainWebSocketUrl.replace(/^ws/, 'http').replace('/phone', '')}/task`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${JARVIS_CONFIG.phoneAuthToken}`,
+        },
+        body: JSON.stringify({instruction: instruction.trim()}),
+      });
+      const json = await res.json() as {taskId?: string; status?: string; error?: string};
+      setSubmitResult(json.error ?? `Accepted — ${json.taskId}`);
+    } catch (e) {
+      setSubmitResult(`Failed: ${String(e)}`);
+    }
+  };
+
+  const permRows = Object.entries(permissions) as [keyof PermissionStatus, boolean][];
+
+  return (
+    <View style={dev.container}>
+      <Text style={dev.heading}>Developer</Text>
+
+      {/* Connection */}
+      <DevSection title="Connection">
+        <DevRow label="Status" value={connection} />
+        <DevRow label="URL" value={JARVIS_CONFIG.brainWebSocketUrl} />
+      </DevSection>
+
+      {/* Permissions */}
+      <DevSection title="Permissions">
+        {permRows.map(([key, val]) => (
+          <DevRow key={key} label={key} value={val ? '✓ granted' : '✗ missing'} valueOk={val} />
+        ))}
+      </DevSection>
+
+      {/* Send task */}
+      <DevSection title="Send Task">
+        <TextInput
+          style={dev.input}
+          placeholder="Enter instruction…"
+          placeholderTextColor="#666"
+          value={instruction}
+          onChangeText={setInstruction}
+          multiline
+        />
+        <Pressable style={dev.button} onPress={submitTask}>
+          <Text style={dev.buttonText}>Submit</Text>
+        </Pressable>
+        {!!submitResult && <Text style={dev.mono}>{submitResult}</Text>}
+      </DevSection>
+
+      {/* Action log */}
+      <DevSection title={`Action Log (last ${log.length})`}>
+        {log.length === 0 && <Text style={dev.empty}>No entries yet.</Text>}
+        {log.slice(0, 20).map((entry, i) => (
+          <View key={i} style={dev.logRow}>
+            <Text style={dev.logKind}>{entry.kind}</Text>
+            <Text style={dev.logDetail} numberOfLines={2}>{entry.detail}</Text>
+            <Text style={dev.logTs}>{new Date(entry.ts).toLocaleTimeString()}</Text>
+          </View>
+        ))}
+      </DevSection>
+
+      {/* Node tree */}
+      <DevSection title="Node Tree">
+        <Pressable style={dev.button} onPress={refreshNodeTree}>
+          <Text style={dev.buttonText}>Capture</Text>
+        </Pressable>
+        {!!nodeTree && (
+          <>
+            <Pressable onPress={() => setNodeExpanded(v => !v)}>
+              <Text style={dev.toggleLink}>{nodeExpanded ? 'Collapse ▲' : 'Expand ▼'}</Text>
+            </Pressable>
+            {nodeExpanded && <Text style={dev.mono}>{nodeTree}</Text>}
+          </>
+        )}
+      </DevSection>
+    </View>
+  );
+}
+
+function DevSection({title, children}: {title: string; children: React.ReactNode}): React.JSX.Element {
+  return (
+    <View style={dev.section}>
+      <Text style={dev.sectionTitle}>{title}</Text>
+      {children}
+    </View>
+  );
+}
+
+function DevRow({label, value, valueOk}: {label: string; value: string; valueOk?: boolean}): React.JSX.Element {
+  return (
+    <View style={dev.devRow}>
+      <Text style={dev.devLabel}>{label}</Text>
+      <Text style={[dev.devValue, valueOk === false && dev.devValueBad, valueOk === true && dev.devValueGood]} numberOfLines={2}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+// ─── Checklist row ────────────────────────────────────────────────────────────
 
 interface ChecklistRowProps {
   number: string;
@@ -178,11 +333,15 @@ function ChecklistRow({number, title, detail, complete, onPress}: ChecklistRowPr
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
   safeArea: {flex: 1, backgroundColor: '#F4F1EA'},
   content: {paddingHorizontal: 22, paddingTop: 28, paddingBottom: 40},
   eyebrow: {fontSize: 11, letterSpacing: 2.1, color: '#746E62', fontWeight: '700'},
   title: {fontSize: 52, lineHeight: 58, color: '#171713', fontWeight: '300', marginTop: 5},
+  devBadge: {alignSelf: 'flex-start', backgroundColor: '#2A4FD4', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6},
+  devBadgeText: {fontSize: 10, color: '#fff', fontWeight: '700', letterSpacing: 1.2},
   intro: {fontSize: 16, lineHeight: 24, color: '#555047', marginTop: 12, maxWidth: 540},
   configCard: {backgroundColor: '#E9DDC7', padding: 16, borderRadius: 14, marginTop: 24},
   configTitle: {fontSize: 15, fontWeight: '700', color: '#342E24'},
@@ -206,6 +365,28 @@ const styles = StyleSheet.create({
   refreshButton: {borderWidth: 1, borderColor: '#4B4941', borderRadius: 9, paddingHorizontal: 12, paddingVertical: 8},
   refreshText: {fontSize: 12, color: '#D9D4C9', fontWeight: '600'},
   note: {fontSize: 12, lineHeight: 18, color: '#777166', marginTop: 20},
+});
+
+const dev = StyleSheet.create({
+  container: {marginTop: 32, borderTopWidth: 2, borderColor: '#2A4FD4', paddingTop: 20},
+  heading: {fontSize: 13, fontWeight: '700', letterSpacing: 1.6, color: '#2A4FD4', marginBottom: 4},
+  section: {marginTop: 20, backgroundColor: '#ECEAE3', borderRadius: 12, padding: 14},
+  sectionTitle: {fontSize: 11, fontWeight: '700', letterSpacing: 1.2, color: '#746E62', marginBottom: 10},
+  devRow: {flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 5, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: '#CCC7BC'},
+  devLabel: {fontSize: 12, color: '#555047', flex: 1},
+  devValue: {fontSize: 12, color: '#24221D', flex: 2, textAlign: 'right'},
+  devValueGood: {color: '#294D3B'},
+  devValueBad: {color: '#8B3A3A'},
+  input: {borderWidth: 1, borderColor: '#BBB4A7', borderRadius: 8, padding: 10, fontSize: 13, color: '#171713', minHeight: 60, textAlignVertical: 'top', backgroundColor: '#FAF8F4'},
+  button: {marginTop: 10, backgroundColor: '#171713', borderRadius: 9, paddingVertical: 10, alignItems: 'center'},
+  buttonText: {color: '#F4F1EA', fontSize: 13, fontWeight: '600'},
+  mono: {marginTop: 8, fontSize: 10, color: '#444', fontFamily: 'monospace', lineHeight: 15},
+  logRow: {paddingVertical: 6, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: '#CCC7BC'},
+  logKind: {fontSize: 9, fontWeight: '700', letterSpacing: 1, color: '#2A4FD4'},
+  logDetail: {fontSize: 12, color: '#24221D', marginTop: 1},
+  logTs: {fontSize: 9, color: '#999', marginTop: 2},
+  empty: {fontSize: 12, color: '#999', fontStyle: 'italic'},
+  toggleLink: {fontSize: 12, color: '#2A4FD4', marginTop: 8, fontWeight: '600'},
 });
 
 export default App;

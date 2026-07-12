@@ -41,6 +41,7 @@ class JarvisForegroundService : Service() {
   private var authToken = ""
   private var reconnect: Runnable? = null
   private var stopped = false
+  private var currentStatus = "Not started"
 
   override fun onCreate() {
     super.onCreate()
@@ -78,6 +79,7 @@ class JarvisForegroundService : Service() {
     )
     stopped = false
     connect()
+    if (socket != null) emitStatus(currentStatus)
     return START_STICKY
   }
 
@@ -217,6 +219,7 @@ class JarvisForegroundService : Service() {
   }
 
   private fun emitStatus(status: String) {
+    currentStatus = status
     JarvisEventBus.emit("connection_status", Arguments.createMap().apply { putString("status", status) })
   }
 

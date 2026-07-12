@@ -18,6 +18,14 @@ type Action =
   | {type: 'action'; action: 'task_complete'; summary: string}
   | {type: 'action'; action: 'task_failed'; reason: string};
 
+export interface LogEntry {
+  ts: number;
+  kind: string;
+  detail: string;
+}
+
+type LogListener = (log: LogEntry[]) => void;
+
 class Controller {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -25,12 +33,24 @@ class Controller {
   private listenersInstalled = false;
   private latestScreen: ScreenEvent = {nodeTreeJson: '[]', packageName: ''};
   private statusListeners = new Set<ConnectionListener>();
+  private logListeners = new Set<LogListener>();
   private currentStatus = 'Not started';
+  private actionLog: LogEntry[] = [];
 
   subscribe(listener: ConnectionListener): () => void {
     this.statusListeners.add(listener);
     listener(this.currentStatus);
     return () => this.statusListeners.delete(listener);
+  }
+
+  subscribeLog(listener: LogListener): () => void {
+    this.logListeners.add(listener);
+    listener(this.actionLog);
+    return () => this.logListeners.delete(listener);
+  }
+
+  getNodeTree(): string {
+    return this.latestScreen.nodeTreeJson;
   }
 
   async start(): Promise<void> {
@@ -98,8 +118,11 @@ class Controller {
       if (message.type === 'request_screen_state') {
         await this.refreshAndSend(null);
       } else if (message.type === 'task_status') {
-        this.setStatus(message.detail ? `${message.status}: ${message.detail}` : message.status);
+        const status = message.detail ? `${message.status}: ${message.detail}` : message.status;
+        this.setStatus(status);
+        this.pushLog('task_status', status);
       } else if (message.type === 'action') {
+        this.pushLog('action', (message as Action).action);
         await this.execute(message);
       }
     } catch (error) {
@@ -180,8 +203,14 @@ class Controller {
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
   }
 
+  private pushLog(kind: string, detail: string): void {
+    this.actionLog = [{ts: Date.now(), kind, detail}, ...this.actionLog].slice(0, 50);
+    for (const listener of this.logListeners) listener(this.actionLog);
+  }
+
   private setStatus(status: string): void {
     this.currentStatus = status;
+    this.pushLog('status', status);
     for (const listener of this.statusListeners) listener(status);
   }
 }
