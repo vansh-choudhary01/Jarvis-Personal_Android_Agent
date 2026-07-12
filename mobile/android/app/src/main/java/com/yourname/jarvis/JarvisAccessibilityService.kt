@@ -14,6 +14,9 @@ import org.json.JSONObject
 
 class JarvisAccessibilityService : AccessibilityService() {
   companion object {
+    private const val MAX_TREE_DEPTH = 45
+    private const val MAX_TREE_NODES = 500
+
     @Volatile var instance: JarvisAccessibilityService? = null
       private set
   }
@@ -125,17 +128,27 @@ class JarvisAccessibilityService : AccessibilityService() {
   }
 
   private fun walk(node: AccessibilityNodeInfo?, output: JSONArray, depth: Int) {
-    if (node == null || depth > 60 || output.length() >= 1500) return
+    if (node == null || depth > MAX_TREE_DEPTH || output.length() >= MAX_TREE_NODES) return
+    if (!node.isVisibleToUser && depth > 0) return
+
     val bounds = Rect().also { node.getBoundsInScreen(it) }
-    output.put(JSONObject().apply {
-      put("text", node.text?.toString().orEmpty())
-      put("contentDescription", node.contentDescription?.toString().orEmpty())
-      put("className", node.className?.toString().orEmpty())
-      put("packageName", node.packageName?.toString().orEmpty())
-      put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)))
-      put("clickable", node.isClickable)
-      put("editable", node.isEditable)
-    })
+    val text = node.text?.toString().orEmpty()
+    val description = node.contentDescription?.toString().orEmpty()
+    val hasLabel = text.isNotBlank() || description.isNotBlank()
+    val isUsefulControl = node.isClickable || node.isEditable || node.isCheckable || node.isFocusable
+    val hasVisibleBounds = bounds.width() > 0 && bounds.height() > 0
+    if (hasVisibleBounds && (hasLabel || isUsefulControl || depth <= 1)) {
+      output.put(JSONObject().apply {
+        put("text", text)
+        put("contentDescription", description)
+        put("className", node.className?.toString().orEmpty())
+        put("packageName", node.packageName?.toString().orEmpty())
+        put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)))
+        put("clickable", node.isClickable)
+        put("editable", node.isEditable)
+      })
+    }
+
     for (index in 0 until node.childCount) walk(node.getChild(index), output, depth + 1)
   }
 }

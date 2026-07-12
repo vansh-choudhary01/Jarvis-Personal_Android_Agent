@@ -42,6 +42,7 @@ class JarvisForegroundService : Service() {
   private var reconnect: Runnable? = null
   private var stopped = false
   private var currentStatus = "Not started"
+  private var taskActive = false
 
   override fun onCreate() {
     super.onCreate()
@@ -125,7 +126,10 @@ class JarvisForegroundService : Service() {
       "task_status" -> {
         val status = message.optString("status")
         val detail = message.optString("detail", status)
-        if (status == "started") JarvisAccessibilityService.instance?.overlayTaskStarted(detail)
+        if (status == "started") {
+          taskActive = true
+          JarvisAccessibilityService.instance?.overlayTaskStarted(detail)
+        }
         emitStatus(detail)
       }
       "action" -> handler.post { execute(message) }
@@ -136,6 +140,7 @@ class JarvisForegroundService : Service() {
     val service = JarvisAccessibilityService.instance
     val name = action.optString("action")
     if (name == "task_complete" || name == "task_failed") {
+      taskActive = false
       val success = name == "task_complete"
       val detail = if (success) action.optString("summary") else action.optString("reason")
       JarvisAccessibilityService.instance?.overlayFinished(detail, success)
@@ -148,7 +153,9 @@ class JarvisForegroundService : Service() {
       if (action.has("progress")) action.optInt("progress") else null,
     )
 
-    fun finish(result: String) = handler.postDelayed({ sendScreenState(result) }, 450)
+    fun finish(result: String, delayMs: Long = settleDelayFor(name)) {
+      if (delayMs <= 0L) sendScreenState(result) else handler.postDelayed({ sendScreenState(result) }, delayMs)
+    }
     try {
       when (name) {
         "list_apps" -> {
@@ -215,9 +222,7 @@ class JarvisForegroundService : Service() {
     }
   }
 
-  fun onAccessibilityChanged() {
-    if (socket != null) sendScreenState(null)
-  }
+  fun onAccessibilityChanged() = Unit
 
   fun sendNotification(packageName: String, title: String, text: String, timestamp: Long) {
     socket?.send(JSONObject()
@@ -248,6 +253,14 @@ class JarvisForegroundService : Service() {
 
   private fun serviceOrThrow(service: JarvisAccessibilityService?) =
     service ?: throw IllegalStateException("Accessibility service is unavailable")
+
+  private fun settleDelayFor(action: String): Long = when (action) {
+    "list_apps", "get_recent_calls" -> 0L
+    "tap", "find_and_tap", "type" -> 120L
+    "swipe" -> 220L
+    "open_app", "call" -> 700L
+    else -> 120L
+  }
 
   override fun onDestroy() {
     stopped = true

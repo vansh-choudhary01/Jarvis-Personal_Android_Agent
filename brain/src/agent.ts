@@ -37,6 +37,7 @@ Rules:
 - Keep calls and messages exactly within the user's stated intent.
 - For call-log results, Android call types are: 1 incoming, 2 outgoing, 3 missed, 4 voicemail, 5 rejected, 6 blocked, 7 answered externally.
 - Use recentPhoneEvents for recent notification-based questions. WhatsApp consumer notifications use package com.whatsapp and WhatsApp Business uses com.whatsapp.w4b.
+- For recent message or call questions, prefer recentPhoneEvents and get_recent_calls before opening apps.
 - When you need to open an app but are unsure of its package name, use list_apps first to discover installed apps, then use open_app with the correct packageName from the results.
 - To read browser history: first use list_apps to find which browser is installed, then open it using open_app, then tap the three-dot menu (contentDescription "More options"), then tap "History", then read the visible entries from the node tree and report them in task_complete.
 - The three-dot menu in Chrome is usually a node with contentDescription "More options". Use find_and_tap with targetText "More options" to open it.`;
@@ -109,7 +110,7 @@ export class AndroidAgent {
       const messages: MessageParam[] = [{role: 'user', content}];
       const response = await this.anthropic!.messages.create({
         model: this.model,
-        max_tokens: 1024,
+        max_tokens: 512,
         temperature: 0,
         system: SYSTEM_PROMPT,
         messages,
@@ -135,7 +136,7 @@ export class AndroidAgent {
         contents: [{role: 'user', parts}],
         config: {
           systemInstruction: SYSTEM_PROMPT,
-          maxOutputTokens: 1024,
+          maxOutputTokens: 512,
           temperature: 0,
           responseMimeType: 'application/json',
         },
