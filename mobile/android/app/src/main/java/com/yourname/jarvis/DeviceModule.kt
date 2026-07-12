@@ -1,11 +1,16 @@
 package com.yourname.jarvis
 
 import android.Manifest
+import android.app.ActivityManager
+import android.content.Context
 import android.content.ComponentName
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
+import android.os.StatFs
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
@@ -13,6 +18,7 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import org.json.JSONObject
 
 class DeviceModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
   init { JarvisEventBus.attach(context) }
@@ -64,6 +70,66 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
     })
   }
 
+  @ReactMethod fun getDeviceProfile(promise: Promise) {
+    runCatching {
+      val activity = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+      val memory = ActivityManager.MemoryInfo().also(activity::getMemoryInfo)
+      val stat = StatFs(context.filesDir.absolutePath)
+      val power = context.getSystemService(PowerManager::class.java)
+      val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+      val batteryStatus = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+      val batteryLevel = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+      val batteryScale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+      val batteryPercent = if (batteryLevel >= 0 && batteryScale > 0) (batteryLevel * 100 / batteryScale) else -1
+      val features = context.packageManager.systemAvailableFeatures.mapNotNull { it.name }
+      val hasVulkan = features.any { it.contains("vulkan", ignoreCase = true) }
+      val hasGpu = context.packageManager.hasSystemFeature(PackageManager.FEATURE_OPENGLES_EXTENSION_PACK) || hasVulkan
+      val hasNpu = features.any {
+        it.contains("neural", ignoreCase = true) ||
+          it.contains("npu", ignoreCase = true) ||
+          it.contains("ai", ignoreCase = true) ||
+          it.contains("hexagon", ignoreCase = true)
+      }
+      val profile = JSONObject()
+        .put("manufacturer", Build.MANUFACTURER.orEmpty())
+        .put("model", Build.MODEL.orEmpty())
+        .put("ramMB", (memory.totalMem / 1024L / 1024L).toInt())
+        .put("cpuCores", Runtime.getRuntime().availableProcessors())
+        .put("architecture", System.getProperty("os.arch").orEmpty())
+        .put("abi", Build.SUPPORTED_ABIS.firstOrNull().orEmpty())
+        .put("androidVersion", Build.VERSION.RELEASE.orEmpty())
+        .put("sdk", Build.VERSION.SDK_INT)
+        .put("storageAvailableMB", (stat.availableBytes / 1024L / 1024L).toInt())
+        .put("batteryState", batteryStateName(batteryStatus))
+        .put("batteryPercent", batteryPercent)
+        .put("thermalStatus", thermalStatusName(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) power.currentThermalStatus else -1))
+        .put("supportsGPUAcceleration", hasGpu)
+        .put("supportsNPUAcceleration", hasNpu)
+
+      context.getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+        .edit()
+        .putString("device_profile", profile.toString())
+        .apply()
+
+      promise.resolve(Arguments.createMap().apply {
+        putString("manufacturer", profile.getString("manufacturer"))
+        putString("model", profile.getString("model"))
+        putInt("ramMB", profile.getInt("ramMB"))
+        putInt("cpuCores", profile.getInt("cpuCores"))
+        putString("architecture", profile.getString("architecture"))
+        putString("abi", profile.getString("abi"))
+        putString("androidVersion", profile.getString("androidVersion"))
+        putInt("sdk", profile.getInt("sdk"))
+        putInt("storageAvailableMB", profile.getInt("storageAvailableMB"))
+        putString("batteryState", profile.getString("batteryState"))
+        putInt("batteryPercent", profile.getInt("batteryPercent"))
+        putString("thermalStatus", profile.getString("thermalStatus"))
+        putBoolean("supportsGPUAcceleration", profile.getBoolean("supportsGPUAcceleration"))
+        putBoolean("supportsNPUAcceleration", profile.getBoolean("supportsNPUAcceleration"))
+      })
+    }.onFailure { promise.reject("DEVICE_PROFILE_FAILED", it) }
+  }
+
   @ReactMethod fun addListener(eventName: String) = Unit
   @ReactMethod fun removeListeners(count: Double) = Unit
 
@@ -72,4 +138,23 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
   }
 
   private fun granted(permission: String) = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+  private fun batteryStateName(status: Int) = when (status) {
+    BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
+    BatteryManager.BATTERY_STATUS_DISCHARGING -> "discharging"
+    BatteryManager.BATTERY_STATUS_FULL -> "full"
+    BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "not_charging"
+    else -> "unknown"
+  }
+
+  private fun thermalStatusName(status: Int) = when (status) {
+    PowerManager.THERMAL_STATUS_NONE -> "none"
+    PowerManager.THERMAL_STATUS_LIGHT -> "light"
+    PowerManager.THERMAL_STATUS_MODERATE -> "moderate"
+    PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+    PowerManager.THERMAL_STATUS_CRITICAL -> "critical"
+    PowerManager.THERMAL_STATUS_EMERGENCY -> "emergency"
+    PowerManager.THERMAL_STATUS_SHUTDOWN -> "shutdown"
+    else -> "unknown"
+  }
 }

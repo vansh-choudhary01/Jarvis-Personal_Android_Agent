@@ -20,6 +20,23 @@ export interface PermissionStatus {
   postNotifications: boolean;
 }
 
+export interface DeviceProfile {
+  manufacturer: string;
+  model: string;
+  ramMB: number;
+  cpuCores: number;
+  architecture: string;
+  abi: string;
+  androidVersion: string;
+  sdk: number;
+  storageAvailableMB: number;
+  batteryState: string;
+  batteryPercent: number;
+  thermalStatus: string;
+  supportsGPUAcceleration: boolean;
+  supportsNPUAcceleration: boolean;
+}
+
 interface AccessibilityModule {
   tap(x: number, y: number): Promise<boolean>;
   type(text: string): Promise<boolean>;
@@ -42,6 +59,7 @@ interface DeviceModule {
   openNotificationSettings(): void;
   openBatterySettings(): void;
   getPermissionStatus(): Promise<PermissionStatus>;
+  getDeviceProfile(): Promise<DeviceProfile>;
 }
 
 export const JarvisAccessibility = NativeModules.JarvisAccessibility as AccessibilityModule;
