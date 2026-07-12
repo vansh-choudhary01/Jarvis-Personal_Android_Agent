@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.PackageManager.NameNotFoundException
 import android.net.Uri
 import android.os.Handler
 import android.os.IBinder
@@ -215,9 +216,7 @@ class JarvisForegroundService : Service() {
     }
   }
 
-  fun onAccessibilityChanged() {
-    if (socket != null) sendScreenState(null)
-  }
+  fun onAccessibilityChanged() = Unit
 
   fun sendNotification(packageName: String, title: String, text: String, timestamp: Long) {
     socket?.send(JSONObject()
@@ -225,6 +224,18 @@ class JarvisForegroundService : Service() {
       .put("packageName", packageName)
       .put("title", title)
       .put("text", text)
+      .put("timestamp", timestamp)
+      .toString())
+  }
+
+  fun sendDeviceObservation(kind: String, packageName: String, className: String, eventType: String, timestamp: Long) {
+    socket?.send(JSONObject()
+      .put("type", "device_observation")
+      .put("kind", kind)
+      .put("packageName", packageName)
+      .put("appLabel", appLabel(packageName))
+      .put("className", className)
+      .put("eventType", eventType)
       .put("timestamp", timestamp)
       .toString())
   }
@@ -248,6 +259,14 @@ class JarvisForegroundService : Service() {
 
   private fun serviceOrThrow(service: JarvisAccessibilityService?) =
     service ?: throw IllegalStateException("Accessibility service is unavailable")
+
+  private fun appLabel(packageName: String): String =
+    try {
+      val info = packageManager.getApplicationInfo(packageName, 0)
+      packageManager.getApplicationLabel(info).toString()
+    } catch (_: NameNotFoundException) {
+      packageName
+    }
 
   override fun onDestroy() {
     stopped = true

@@ -8,24 +8,29 @@ import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.WindowManager
-import com.facebook.react.bridge.Arguments
 import org.json.JSONArray
 import org.json.JSONObject
 
 class JarvisAccessibilityService : AccessibilityService() {
   companion object {
+    private const val MAX_TREE_DEPTH = 45
+    private const val MAX_TREE_NODES = 500
+
     @Volatile var instance: JarvisAccessibilityService? = null
       private set
   }
 
   @Volatile private var latestTree = "[]"
   private lateinit var overlay: JarvisOverlayController
+  private var lastPackageName = ""
+  private var lastClassName = ""
+  private var lastWindowObservationAt = 0L
+  private var lastInteractionObservationAt = 0L
 
   override fun onServiceConnected() {
     instance = this
     overlay = JarvisOverlayController(this, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
     overlay.show()
-    refreshAndEmit()
   }
 
   fun overlayTaskStarted(instruction: String) = overlay.taskStarted(instruction)
@@ -33,7 +38,7 @@ class JarvisAccessibilityService : AccessibilityService() {
   fun overlayFinished(message: String, success: Boolean) = overlay.taskFinished(message, success)
   fun overlayConnection(status: String) = overlay.connection(status)
 
-  override fun onAccessibilityEvent(event: AccessibilityEvent?) = refreshAndEmit()
+  override fun onAccessibilityEvent(event: AccessibilityEvent?) = observeLightweight(event)
   override fun onInterrupt() = Unit
 
   override fun onDestroy() {
@@ -105,17 +110,66 @@ class JarvisAccessibilityService : AccessibilityService() {
     if (!accepted) callback(false)
   }
 
-  private fun refreshAndEmit() {
-    refreshTree()
-    val root = rootInActiveWindow
-    JarvisEventBus.emit(
-      "screen_state",
-      Arguments.createMap().apply {
-        putString("nodeTreeJson", latestTree)
-        putString("packageName", root?.packageName?.toString().orEmpty())
-      },
-    )
-    JarvisForegroundService.instance?.onAccessibilityChanged()
+  private fun observeLightweight(event: AccessibilityEvent?) {
+    if (event == null) return
+    val packageName = event.packageName?.toString().orEmpty()
+    if (packageName.isBlank() || packageName == this.packageName) return
+
+    val className = event.className?.toString().orEmpty()
+    val now = System.currentTimeMillis()
+    when (event.eventType) {
+      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+        val packageChanged = packageName != lastPackageName
+        val screenChanged = className.isNotBlank() && className != lastClassName
+        if (packageChanged || screenChanged || now - lastWindowObservationAt > 10_000L) {
+          lastPackageName = packageName
+          lastClassName = className
+          lastWindowObservationAt = now
+          JarvisForegroundService.instance?.sendDeviceObservation(
+            if (packageChanged) "app_changed" else "screen_changed",
+            packageName,
+            className,
+            eventTypeName(event.eventType),
+            now,
+          )
+        }
+      }
+      AccessibilityEvent.TYPE_VIEW_CLICKED,
+      AccessibilityEvent.TYPE_VIEW_FOCUSED,
+      AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+        if (now - lastInteractionObservationAt > 5_000L) {
+          lastInteractionObservationAt = now
+          JarvisForegroundService.instance?.sendDeviceObservation(
+            "user_interaction",
+            packageName,
+            className,
+            eventTypeName(event.eventType),
+            now,
+          )
+        }
+      }
+      AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+        if (now - lastWindowObservationAt > 15_000L) {
+          lastWindowObservationAt = now
+          JarvisForegroundService.instance?.sendDeviceObservation(
+            "screen_activity",
+            packageName,
+            className,
+            eventTypeName(event.eventType),
+            now,
+          )
+        }
+      }
+    }
+  }
+
+  private fun eventTypeName(type: Int) = when (type) {
+    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "window_state_changed"
+    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "window_content_changed"
+    AccessibilityEvent.TYPE_VIEW_FOCUSED -> "view_focused"
+    AccessibilityEvent.TYPE_VIEW_CLICKED -> "view_clicked"
+    AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "view_text_changed"
+    else -> "accessibility_event"
   }
 
   private fun refreshTree() {
@@ -125,17 +179,27 @@ class JarvisAccessibilityService : AccessibilityService() {
   }
 
   private fun walk(node: AccessibilityNodeInfo?, output: JSONArray, depth: Int) {
-    if (node == null || depth > 60 || output.length() >= 1500) return
+    if (node == null || depth > MAX_TREE_DEPTH || output.length() >= MAX_TREE_NODES) return
+    if (!node.isVisibleToUser && depth > 0) return
+
     val bounds = Rect().also { node.getBoundsInScreen(it) }
-    output.put(JSONObject().apply {
-      put("text", node.text?.toString().orEmpty())
-      put("contentDescription", node.contentDescription?.toString().orEmpty())
-      put("className", node.className?.toString().orEmpty())
-      put("packageName", node.packageName?.toString().orEmpty())
-      put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)))
-      put("clickable", node.isClickable)
-      put("editable", node.isEditable)
-    })
+    val text = node.text?.toString().orEmpty()
+    val description = node.contentDescription?.toString().orEmpty()
+    val hasLabel = text.isNotBlank() || description.isNotBlank()
+    val isUsefulControl = node.isClickable || node.isEditable || node.isCheckable || node.isFocusable
+    val hasVisibleBounds = bounds.width() > 0 && bounds.height() > 0
+    if (hasVisibleBounds && (hasLabel || isUsefulControl || depth <= 1)) {
+      output.put(JSONObject().apply {
+        put("text", text)
+        put("contentDescription", description)
+        put("className", node.className?.toString().orEmpty())
+        put("packageName", node.packageName?.toString().orEmpty())
+        put("bounds", JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)))
+        put("clickable", node.isClickable)
+        put("editable", node.isEditable)
+      })
+    }
+
     for (index in 0 until node.childCount) walk(node.getChild(index), output, depth + 1)
   }
 }

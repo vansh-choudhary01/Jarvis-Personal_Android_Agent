@@ -32,6 +32,15 @@ export const phoneMessageSchema = z.discriminatedUnion('type', [
     body: z.string(),
     timestamp: z.number(),
   }),
+  z.object({
+    type: z.literal('device_observation'),
+    kind: z.enum(['app_changed', 'screen_changed', 'screen_activity', 'user_interaction']),
+    packageName: z.string(),
+    appLabel: z.string().optional().default(''),
+    className: z.string().optional().default(''),
+    eventType: z.string().optional().default(''),
+    timestamp: z.number(),
+  }),
 ]);
 
 const progressFields = {
