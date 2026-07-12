@@ -1,4 +1,6 @@
-import type {DeviceProfile} from './native';
+import {DeviceEventEmitter} from 'react-native';
+import registry from './modelRegistry.json';
+import {JarvisLocalAiRuntime, type DeviceProfile, type NativeRuntimeDiagnostics} from './native';
 
 export type RuntimeProvider =
   | 'auto'
@@ -11,7 +13,15 @@ export type RuntimeProvider =
   | 'unknown';
 
 export type CapabilityScore = 'Low' | 'Medium' | 'High' | 'Ultra';
-export type ModelInstallStatus = 'not_installed' | 'queued' | 'downloading' | 'paused' | 'installed' | 'failed';
+export type ModelInstallStatus =
+  | 'not_installed'
+  | 'downloading'
+  | 'paused'
+  | 'installing'
+  | 'ready'
+  | 'loading'
+  | 'loaded'
+  | 'failed';
 
 export interface RuntimeDetection {
   provider: RuntimeProvider;
@@ -29,11 +39,14 @@ export interface ModelDefinition {
   quantization: string;
   runtime: RuntimeProvider;
   downloadUrl: string;
+  fileName: string;
+  checksumSha256: string;
   downloadSizeGB: number;
   installedSizeGB: number;
   minRamGB: number;
   recommendedRamGB: number;
   recommendedCpuClass: string;
+  contextLength: number;
   supportsVision: boolean;
   supportsToolCalling: boolean;
   supportsReasoning: boolean;
@@ -48,6 +61,8 @@ export interface ModelRecommendation {
   score: CapabilityScore;
   reason: string;
   estimatedMemoryGB: number;
+  estimatedPerformance: string;
+  estimatedStorageGB: number;
 }
 
 export interface InstalledModel {
@@ -56,6 +71,9 @@ export interface InstalledModel {
   progress: number;
   active: boolean;
   installedSizeGB: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  error?: string;
 }
 
 export interface RuntimeSettings {
@@ -82,6 +100,11 @@ export interface RuntimeDiagnostics {
   generationSpeedTokPerSec: number;
   plannerMode: string;
   temperature: number;
+  loaded: boolean;
+  hardwareAccelerationStatus: string;
+  cpuUsage: string;
+  timeToFirstTokenMs: number;
+  loadTimeMs: number;
 }
 
 export interface GenerationRequest {
@@ -100,11 +123,16 @@ export interface GenerationResult {
 
 export interface ModelRuntime {
   initialize(profile: DeviceProfile): Promise<void>;
+  loadModel(model?: ModelDefinition): Promise<void>;
   generate(request: GenerationRequest): Promise<GenerationResult>;
   stream(request: GenerationRequest): AsyncGenerator<string>;
   cancel(): Promise<void>;
   unload(): Promise<void>;
+  dispose(): Promise<void>;
   getActiveModel(): ModelDefinition | null;
+  isLoaded(): Promise<boolean>;
+  supportsVision(): boolean;
+  supportsToolCalling(): boolean;
 }
 
 export const DEFAULT_RUNTIME_SETTINGS: RuntimeSettings = {
@@ -114,165 +142,10 @@ export const DEFAULT_RUNTIME_SETTINGS: RuntimeSettings = {
   allowLargerModels: false,
   preferFasterModels: true,
   preferHigherAccuracy: false,
-  allowCloudFallback: true,
+  allowCloudFallback: false,
 };
 
-export const MODEL_REGISTRY: ModelDefinition[] = [
-  {
-    id: 'gemma-3-1b-q4',
-    displayName: 'Gemma 3 1B (Q4)',
-    family: 'Gemma',
-    version: '3',
-    provider: 'Google',
-    parameters: '1B',
-    quantization: 'Q4',
-    runtime: 'google-ai-edge',
-    downloadUrl: 'https://huggingface.co/google/gemma-3-1b-it',
-    downloadSizeGB: 0.9,
-    installedSizeGB: 1.1,
-    minRamGB: 3.5,
-    recommendedRamGB: 4,
-    recommendedCpuClass: 'mobile-low',
-    supportsVision: false,
-    supportsToolCalling: false,
-    supportsReasoning: false,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['4 GB phones', 'fast offline chat', 'classification'],
-  },
-  {
-    id: 'deepseek-r1-distill-qwen-1.5b-q4',
-    displayName: 'DeepSeek-R1 Distill Qwen 1.5B (Q4)',
-    family: 'DeepSeek-R1 Distill',
-    version: '1.5B',
-    provider: 'DeepSeek',
-    parameters: '1.5B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
-    downloadSizeGB: 1.1,
-    installedSizeGB: 1.4,
-    minRamGB: 4,
-    recommendedRamGB: 4,
-    recommendedCpuClass: 'mobile-low',
-    supportsVision: false,
-    supportsToolCalling: false,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['small reasoning tasks', '4 GB phones', 'offline summaries'],
-  },
-  {
-    id: 'qwen3-4b-q4',
-    displayName: 'Qwen 3 4B (Q4)',
-    family: 'Qwen',
-    version: '3',
-    provider: 'Alibaba Cloud',
-    parameters: '4B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/Qwen/Qwen3-4B-GGUF',
-    downloadSizeGB: 2.4,
-    installedSizeGB: 2.7,
-    minRamGB: 6,
-    recommendedRamGB: 8,
-    recommendedCpuClass: 'mobile-mid',
-    supportsVision: false,
-    supportsToolCalling: true,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['balanced phone automation', 'tool calling', 'offline chat'],
-  },
-  {
-    id: 'deepseek-r1-distill-qwen-7b-q4',
-    displayName: 'DeepSeek-R1 Distill Qwen 7B (Q4)',
-    family: 'DeepSeek-R1 Distill',
-    version: '7B',
-    provider: 'DeepSeek',
-    parameters: '7B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
-    downloadSizeGB: 4.1,
-    installedSizeGB: 4.7,
-    minRamGB: 8,
-    recommendedRamGB: 10,
-    recommendedCpuClass: 'mobile-high',
-    supportsVision: false,
-    supportsToolCalling: false,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['reasoning-heavy tasks', 'high-RAM phones'],
-  },
-  {
-    id: 'qwen3-8b-q4',
-    displayName: 'Qwen 3 8B (Q4)',
-    family: 'Qwen',
-    version: '3',
-    provider: 'Alibaba Cloud',
-    parameters: '8B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/Qwen/Qwen3-8B-GGUF',
-    downloadSizeGB: 4.8,
-    installedSizeGB: 5.4,
-    minRamGB: 10,
-    recommendedRamGB: 12,
-    recommendedCpuClass: 'mobile-high',
-    supportsVision: false,
-    supportsToolCalling: true,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['12 GB phones', 'better planning quality', 'tool calling'],
-  },
-  {
-    id: 'deepseek-r1-distill-llama-8b-q4',
-    displayName: 'DeepSeek-R1 Distill Llama 8B (Q4)',
-    family: 'DeepSeek-R1 Distill',
-    version: '8B',
-    provider: 'DeepSeek',
-    parameters: '8B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B',
-    downloadSizeGB: 4.9,
-    installedSizeGB: 5.5,
-    minRamGB: 10,
-    recommendedRamGB: 12,
-    recommendedCpuClass: 'mobile-high',
-    supportsVision: false,
-    supportsToolCalling: false,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['reasoning-heavy tasks', '12 GB phones'],
-  },
-  {
-    id: 'qwen3-14b-q4',
-    displayName: 'Qwen 3 14B (Q4)',
-    family: 'Qwen',
-    version: '3',
-    provider: 'Alibaba Cloud',
-    parameters: '14B',
-    quantization: 'Q4_K_M',
-    runtime: 'llama.cpp',
-    downloadUrl: 'https://huggingface.co/Qwen/Qwen3-14B-GGUF',
-    downloadSizeGB: 8.2,
-    installedSizeGB: 9.0,
-    minRamGB: 16,
-    recommendedRamGB: 24,
-    recommendedCpuClass: 'desktop',
-    supportsVision: false,
-    supportsToolCalling: true,
-    supportsReasoning: true,
-    supportsStreaming: true,
-    supportsOffline: true,
-    recommendedFor: ['desktop devices', 'larger context tasks', 'advanced automation'],
-  },
-];
+export const MODEL_REGISTRY = registry as ModelDefinition[];
 
 export function ramGB(profile: DeviceProfile): number {
   return profile.ramMB / 1024;
@@ -290,28 +163,25 @@ export function computeCapabilityScore(profile: DeviceProfile): CapabilityScore 
 
 export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection[] {
   const arm64 = profile.abi.includes('arm64') || profile.architecture.includes('aarch64');
-  const enoughStorage = profile.storageAvailableMB > 1024;
+  const mediaPipeCandidate = profile.sdk >= 26 && arm64;
 
   return [
     {
-      provider: 'google-ai-edge',
-      available: false,
-      reason: profile.sdk >= 26 && arm64 ? 'Compatible target, but the Google AI Edge adapter is not bundled yet.' : 'Requires a modern 64-bit Android device.',
-    },
-    {
       provider: 'mediapipe',
-      available: false,
-      reason: profile.sdk >= 26 && arm64 ? 'Compatible target, but the MediaPipe runtime binary is not bundled yet.' : 'Requires Android 8+ on arm64.',
-    },
-    {
-      provider: 'llama.cpp',
-      available: false,
-      reason: arm64 && enoughStorage ? 'Compatible target, but llama.cpp native libraries are not bundled yet.' : 'Requires arm64 and enough free storage for model files.',
+      available: mediaPipeCandidate,
+      reason: mediaPipeCandidate
+        ? 'MediaPipe runtime is packaged and can use the best supported Android backend at load time.'
+        : 'MediaPipe runtime is not available on this device. Requires Android 8+ on arm64.',
     },
     {
       provider: 'mlc-llm',
       available: false,
-      reason: profile.supportsGPUAcceleration ? 'GPU-capable target, but MLC runtime packaging is not bundled yet.' : 'GPU acceleration was not detected.',
+      reason: 'Future provider placeholder. No MLC LLM adapter is bundled yet.',
+    },
+    {
+      provider: 'llama.cpp',
+      available: false,
+      reason: 'Future provider placeholder. No llama.cpp adapter is bundled yet.',
     },
     {
       provider: 'executorch',
@@ -321,7 +191,7 @@ export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection
     {
       provider: 'qualcomm-ai-engine',
       available: false,
-      reason: profile.supportsNPUAcceleration ? 'Possible accelerator detected, but Qualcomm AI Engine integration is not bundled yet.' : 'No detectable Qualcomm/NPU feature was exposed by Android.',
+      reason: 'Future provider placeholder. Hardware acceleration remains hidden behind the runtime abstraction.',
     },
   ];
 }
@@ -329,6 +199,7 @@ export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection
 export function compatibleModels(profile: DeviceProfile, allowLargerModels = false): ModelDefinition[] {
   const ram = ramGB(profile);
   return MODEL_REGISTRY.filter(model => {
+    if (model.runtime !== 'mediapipe') return false;
     if (!allowLargerModels && model.minRamGB > ram) return false;
     return model.installedSizeGB * 1024 < profile.storageAvailableMB;
   });
@@ -342,142 +213,257 @@ export function recommendModel(
   const ram = ramGB(profile);
   const candidates = compatibleModels(profile, settings.allowLargerModels);
   const fallback = candidates[0] ?? MODEL_REGISTRY[0]!;
-
   const pickById = (id: string) => candidates.find(model => model.id === id) ?? fallback;
+
   let model: ModelDefinition;
   if (settings.modelId !== 'auto') {
     model = MODEL_REGISTRY.find(item => item.id === settings.modelId) ?? fallback;
   } else if (ram < 5) {
-    model = settings.preferHigherAccuracy ? pickById('deepseek-r1-distill-qwen-1.5b-q4') : pickById('gemma-3-1b-q4');
+    model = settings.preferHigherAccuracy
+      ? pickById('deepseek-r1-distill-qwen-1.5b-mediapipe-q4')
+      : pickById('gemma-3-1b-mediapipe-q4');
   } else if (ram < 10) {
-    model = settings.preferHigherAccuracy && !settings.preferFasterModels ? pickById('deepseek-r1-distill-qwen-7b-q4') : pickById('qwen3-4b-q4');
-  } else if (ram < 16) {
-    model = settings.preferHigherAccuracy ? pickById('deepseek-r1-distill-llama-8b-q4') : pickById('qwen3-8b-q4');
+    model = settings.preferHigherAccuracy && !settings.preferFasterModels
+      ? pickById('deepseek-r1-distill-qwen-7b-mediapipe-q4')
+      : pickById('qwen3-4b-mediapipe-q4');
   } else {
-    model = pickById('qwen3-14b-q4');
+    model = settings.preferHigherAccuracy
+      ? pickById('deepseek-r1-distill-qwen-7b-mediapipe-q4')
+      : pickById('qwen3-8b-mediapipe-q4');
   }
 
+  const runtime = settings.runtime === 'auto' ? 'mediapipe' : settings.runtime;
   return {
     model,
-    runtime: settings.runtime === 'auto' ? model.runtime : settings.runtime,
+    runtime,
     score,
     reason: `Selected for ${Math.round(ram)} GB RAM, ${profile.cpuCores} CPU cores, ${score.toLowerCase()} capability, and ${settings.preferFasterModels ? 'faster response preference' : 'quality preference'}.`,
     estimatedMemoryGB: Math.round(model.installedSizeGB * 0.78 * 10) / 10,
+    estimatedPerformance: score === 'Low' ? 'Usable for short responses' : score === 'Medium' ? 'Balanced offline chat' : 'Good offline automation latency',
+    estimatedStorageGB: model.installedSizeGB,
   };
 }
 
-class LocalModelManager {
-  private installed = new Map<string, InstalledModel>();
-  private activeModelId: string | null = null;
+function modelPayload(model: ModelDefinition) {
+  return {
+    ...model,
+    expectedSizeBytes: Math.round(model.downloadSizeGB * 1024 * 1024 * 1024),
+  };
+}
 
-  listInstalled(): InstalledModel[] {
-    return Array.from(this.installed.values());
+function nativeStateToInstalled(value: any): InstalledModel {
+  return {
+    modelId: String(value.modelId),
+    status: String(value.status ?? 'not_installed') as ModelInstallStatus,
+    progress: Number(value.progress ?? 0),
+    active: Boolean(value.active),
+    installedSizeGB: Number(value.installedSizeBytes ?? 0) / 1024 / 1024 / 1024,
+    downloadedBytes: Number(value.downloadedBytes ?? 0),
+    totalBytes: Number(value.totalBytes ?? 0),
+    error: value.error ? String(value.error) : undefined,
+  };
+}
+
+class NativeModelManager {
+  async listInstalled(): Promise<InstalledModel[]> {
+    const rows = await JarvisLocalAiRuntime.listInstalledModels();
+    return rows.map(nativeStateToInstalled);
   }
 
-  getModelState(modelId: string): InstalledModel {
-    return this.installed.get(modelId) ?? {
-      modelId,
-      status: 'not_installed',
-      progress: 0,
-      active: false,
-      installedSizeGB: 0,
-    };
+  async getModelState(modelId: string): Promise<InstalledModel> {
+    return nativeStateToInstalled(await JarvisLocalAiRuntime.getModelState(modelId));
   }
 
-  getStorageUsageGB(): number {
-    return this.listInstalled().reduce((total, item) => total + item.installedSizeGB, 0);
+  async getStorageUsageGB(): Promise<number> {
+    return (await JarvisLocalAiRuntime.getStorageUsageBytes()) / 1024 / 1024 / 1024;
   }
 
-  beginDownload(modelId: string): InstalledModel {
-    const model = MODEL_REGISTRY.find(item => item.id === modelId);
-    if (!model) throw new Error(`Unknown model: ${modelId}`);
-    const state: InstalledModel = {
-      modelId,
-      status: 'queued',
-      progress: 0,
-      active: false,
-      installedSizeGB: 0,
-    };
-    this.installed.set(modelId, state);
-    return state;
+  async install(model: ModelDefinition): Promise<InstalledModel> {
+    await JarvisLocalAiRuntime.downloadModel(modelPayload(model));
+    return this.getModelState(model.id);
   }
 
-  pauseDownload(modelId: string): InstalledModel {
-    return this.patch(modelId, {status: 'paused'});
+  async pauseDownload(modelId: string): Promise<InstalledModel> {
+    await JarvisLocalAiRuntime.pauseDownload(modelId);
+    return this.getModelState(modelId);
   }
 
-  resumeDownload(modelId: string): InstalledModel {
-    return this.patch(modelId, {status: 'queued'});
+  async resumeDownload(model: ModelDefinition): Promise<InstalledModel> {
+    await JarvisLocalAiRuntime.resumeDownload(modelPayload(model));
+    return this.getModelState(model.id);
   }
 
-  deleteModel(modelId: string): void {
-    this.installed.delete(modelId);
-    if (this.activeModelId === modelId) this.activeModelId = null;
+  async cancelDownload(modelId: string): Promise<InstalledModel> {
+    await JarvisLocalAiRuntime.cancelDownload(modelId);
+    return this.getModelState(modelId);
   }
 
-  switchActiveModel(modelId: string): InstalledModel {
-    const current = this.getModelState(modelId);
-    if (current.status !== 'installed') throw new Error('Model is not installed yet.');
-    this.installed.forEach(value => {
-      value.active = false;
-    });
-    current.active = true;
-    this.activeModelId = modelId;
-    this.installed.set(modelId, current);
-    return current;
+  async deleteModel(modelId: string): Promise<void> {
+    await JarvisLocalAiRuntime.deleteModel(modelId);
   }
 
-  private patch(modelId: string, patch: Partial<InstalledModel>): InstalledModel {
-    const next = {...this.getModelState(modelId), ...patch};
-    this.installed.set(modelId, next);
-    return next;
+  async switchActiveModel(modelId: string): Promise<InstalledModel> {
+    await JarvisLocalAiRuntime.setActiveModel(modelId);
+    return this.getModelState(modelId);
   }
 }
 
-export const modelManager = new LocalModelManager();
+export const modelManager = new NativeModelManager();
 
-export class LocalAiRuntime implements ModelRuntime {
+export class MediaPipeRuntime implements ModelRuntime {
   private activeModel: ModelDefinition | null = null;
+  private profile: DeviceProfile | null = null;
 
   async initialize(profile: DeviceProfile): Promise<void> {
+    this.profile = profile;
+    const detection = await JarvisLocalAiRuntime.detectMediaPipe();
+    if (!detection.available) {
+      throw new Error(detection.reason);
+    }
     this.activeModel = recommendModel(profile).model;
+    const activeId = await JarvisLocalAiRuntime.getActiveModelId();
+    if (activeId) this.activeModel = MODEL_REGISTRY.find(model => model.id === activeId) ?? this.activeModel;
   }
 
-  async generate(): Promise<GenerationResult> {
-    throw new Error('Local inference is not available until a runtime provider adapter is bundled.');
+  async loadModel(model = this.activeModel ?? undefined): Promise<void> {
+    if (!model) throw new Error('No local model selected.');
+    await JarvisLocalAiRuntime.loadModel(modelPayload(model), model.contextLength, 0.3);
+    this.activeModel = model;
   }
 
-  async *stream(): AsyncGenerator<string> {
-    throw new Error('Local streaming is not available until a runtime provider adapter is bundled.');
+  async generate(request: GenerationRequest): Promise<GenerationResult> {
+    if (!this.activeModel && this.profile) this.activeModel = recommendModel(this.profile).model;
+    if (!this.activeModel) throw new Error('No active local model.');
+    const result = await JarvisLocalAiRuntime.generate(
+      request.prompt,
+      request.maxTokens ?? 512,
+      request.temperature ?? 0.3,
+    );
+    return {
+      text: result.text,
+      modelId: result.modelId || this.activeModel.id,
+      provider: 'mediapipe',
+      tokensGenerated: result.tokensGenerated ?? estimateTokens(result.text),
+    };
+  }
+
+  async *stream(request: GenerationRequest): AsyncGenerator<string> {
+    const queue: string[] = [];
+    let done = false;
+    let error: Error | null = null;
+    let wake: (() => void) | null = null;
+    const wakeNext = () => {
+      wake?.();
+      wake = null;
+    };
+    const tokenSub = DeviceEventEmitter.addListener('local_ai_token', event => {
+      if (!event?.text) return;
+      queue.push(String(event.text));
+      wakeNext();
+    });
+    const doneSub = DeviceEventEmitter.addListener('local_ai_done', () => {
+      done = true;
+      wakeNext();
+    });
+    const errorSub = DeviceEventEmitter.addListener('local_ai_error', event => {
+      error = new Error(String(event?.message ?? 'Local generation failed.'));
+      done = true;
+      wakeNext();
+    });
+
+    try {
+      JarvisLocalAiRuntime.stream(request.prompt, request.maxTokens ?? 512, request.temperature ?? 0.3).catch((err: unknown) => {
+        error = err instanceof Error ? err : new Error(String(err));
+        done = true;
+        wakeNext();
+      });
+      while (!done || queue.length > 0) {
+        if (queue.length > 0) {
+          yield queue.shift()!;
+        } else {
+          await new Promise<void>(resolve => {
+            wake = resolve;
+          });
+        }
+      }
+      if (error) throw error;
+    } finally {
+      tokenSub.remove();
+      doneSub.remove();
+      errorSub.remove();
+    }
   }
 
   async cancel(): Promise<void> {
-    return;
+    await JarvisLocalAiRuntime.cancel();
   }
 
   async unload(): Promise<void> {
+    await JarvisLocalAiRuntime.unload();
+  }
+
+  async dispose(): Promise<void> {
+    await JarvisLocalAiRuntime.dispose();
     this.activeModel = null;
   }
 
   getActiveModel(): ModelDefinition | null {
     return this.activeModel;
   }
+
+  async isLoaded(): Promise<boolean> {
+    return JarvisLocalAiRuntime.isLoaded();
+  }
+
+  supportsVision(): boolean {
+    return this.activeModel?.supportsVision ?? false;
+  }
+
+  supportsToolCalling(): boolean {
+    return this.activeModel?.supportsToolCalling ?? false;
+  }
+}
+
+export async function getRuntimeDiagnostics(recommendation: ModelRecommendation): Promise<RuntimeDiagnostics> {
+  const native = await JarvisLocalAiRuntime.getDiagnostics();
+  return diagnosticsFromNative(native, recommendation);
+}
+
+export function diagnosticsFromNative(
+  native: NativeRuntimeDiagnostics,
+  recommendation: ModelRecommendation,
+): RuntimeDiagnostics {
+  return {
+    provider: 'mediapipe',
+    currentModel: native.currentModel || recommendation.model.displayName,
+    contextLength: native.contextLength || recommendation.model.contextLength,
+    inferenceDevice: native.inferenceDevice || 'Auto',
+    accelerator: native.accelerator || 'Runtime selected',
+    memoryUsageGB: roundGB(native.memoryUsageBytes),
+    peakMemoryGB: roundGB(native.peakMemoryBytes),
+    modelSizeGB: roundGB(native.modelSizeBytes) || recommendation.model.installedSizeGB,
+    promptTokens: native.promptTokens ?? 0,
+    generatedTokens: native.generatedTokens ?? 0,
+    generationSpeedTokPerSec: native.generationSpeedTokPerSec ?? 0,
+    plannerMode: 'Planner will use ModelRuntime.generate only',
+    temperature: native.temperature ?? 0.3,
+    loaded: Boolean(native.loaded),
+    hardwareAccelerationStatus: native.hardwareAccelerationStatus || 'Automatic backend selection',
+    cpuUsage: native.cpuUsage || 'Unavailable',
+    timeToFirstTokenMs: native.timeToFirstTokenMs ?? 0,
+    loadTimeMs: native.loadTimeMs ?? 0,
+  };
 }
 
 export function createPlaceholderDiagnostics(recommendation: ModelRecommendation): RuntimeDiagnostics {
-  return {
-    provider: recommendation.runtime,
-    currentModel: recommendation.model.displayName,
-    contextLength: 8192,
-    inferenceDevice: 'Not loaded',
-    accelerator: 'Detecting',
-    memoryUsageGB: 0,
-    peakMemoryGB: 0,
-    modelSizeGB: recommendation.model.installedSizeGB,
-    promptTokens: 0,
-    generatedTokens: 0,
-    generationSpeedTokPerSec: 0,
-    plannerMode: 'Cloud planner remains active until local runtime provider is installed',
-    temperature: 0.3,
-  };
+  return diagnosticsFromNative({} as NativeRuntimeDiagnostics, recommendation);
+}
+
+function estimateTokens(text: string): number {
+  return text.trim() ? text.trim().split(/\s+/).length : 0;
+}
+
+function roundGB(bytes?: number): number {
+  if (!bytes) return 0;
+  return Math.round((bytes / 1024 / 1024 / 1024) * 10) / 10;
 }

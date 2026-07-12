@@ -62,6 +62,60 @@ interface DeviceModule {
   getDeviceProfile(): Promise<DeviceProfile>;
 }
 
+export interface NativeInstalledModel {
+  modelId: string;
+  status: string;
+  progress: number;
+  active: boolean;
+  installedSizeBytes: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  error?: string;
+}
+
+export interface NativeRuntimeDiagnostics {
+  provider?: string;
+  currentModel?: string;
+  contextLength?: number;
+  inferenceDevice?: string;
+  accelerator?: string;
+  memoryUsageBytes?: number;
+  peakMemoryBytes?: number;
+  modelSizeBytes?: number;
+  promptTokens?: number;
+  generatedTokens?: number;
+  generationSpeedTokPerSec?: number;
+  temperature?: number;
+  loaded?: boolean;
+  hardwareAccelerationStatus?: string;
+  cpuUsage?: string;
+  timeToFirstTokenMs?: number;
+  loadTimeMs?: number;
+}
+
+interface LocalAiRuntimeModule {
+  detectMediaPipe(): Promise<{provider: string; available: boolean; reason: string}>;
+  getActiveModelId(): Promise<string | null>;
+  setActiveModel(modelId: string): Promise<boolean>;
+  listInstalledModels(): Promise<NativeInstalledModel[]>;
+  getModelState(modelId: string): Promise<NativeInstalledModel>;
+  getStorageUsageBytes(): Promise<number>;
+  downloadModel(model: Record<string, unknown>): Promise<boolean>;
+  pauseDownload(modelId: string): Promise<boolean>;
+  resumeDownload(model: Record<string, unknown>): Promise<boolean>;
+  cancelDownload(modelId: string): Promise<boolean>;
+  deleteModel(modelId: string): Promise<boolean>;
+  loadModel(model: Record<string, unknown>, maxTokens: number, temperature: number): Promise<boolean>;
+  generate(prompt: string, maxTokens: number, temperature: number): Promise<{text: string; modelId: string; tokensGenerated: number}>;
+  stream(prompt: string, maxTokens: number, temperature: number): Promise<boolean>;
+  cancel(): Promise<boolean>;
+  unload(): Promise<boolean>;
+  dispose(): Promise<boolean>;
+  isLoaded(): Promise<boolean>;
+  getDiagnostics(): Promise<NativeRuntimeDiagnostics>;
+}
+
 export const JarvisAccessibility = NativeModules.JarvisAccessibility as AccessibilityModule;
 export const JarvisTelephony = NativeModules.JarvisTelephony as TelephonyModule;
 export const JarvisDevice = NativeModules.JarvisDevice as DeviceModule;
+export const JarvisLocalAiRuntime = NativeModules.JarvisLocalAiRuntime as LocalAiRuntimeModule;

@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   AppState,
+  DeviceEventEmitter,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -19,11 +20,13 @@ import {
   DEFAULT_RUNTIME_SETTINGS,
   MODEL_REGISTRY,
   computeCapabilityScore,
-  createPlaceholderDiagnostics,
   detectRuntimeProviders,
+  getRuntimeDiagnostics,
   modelManager,
   recommendModel,
+  type InstalledModel,
   type ModelDefinition,
+  type RuntimeDiagnostics,
   type RuntimeSettings,
 } from './src/localAiRuntime';
 
@@ -225,23 +228,82 @@ function RuntimeSettingsScreen({
   const [settings, setSettings] = useState<RuntimeSettings>(DEFAULT_RUNTIME_SETTINGS);
   const [selectedModelId, setSelectedModelId] = useState(MODEL_REGISTRY[0]!.id);
   const [message, setMessage] = useState('');
-  const [, refreshModels] = useState(0);
+  const [models, setModels] = useState<InstalledModel[]>([]);
+  const [storageUsedGB, setStorageUsedGB] = useState(0);
+  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(null);
+  const [testPrompt, setTestPrompt] = useState('Say hello from the local offline model in one sentence.');
+  const [testResult, setTestResult] = useState('');
+  const [busyModelId, setBusyModelId] = useState<string | null>(null);
   const selectedModel = MODEL_REGISTRY.find(model => model.id === selectedModelId) ?? MODEL_REGISTRY[0]!;
-  const detections = profile ? detectRuntimeProviders(profile) : [];
-  const recommendation = profile ? recommendModel(profile, settings) : null;
-  const diagnostics = recommendation ? createPlaceholderDiagnostics(recommendation) : null;
+  const detections = useMemo(() => profile ? detectRuntimeProviders(profile) : [], [profile]);
+  const recommendation = useMemo(() => profile ? recommendModel(profile, settings) : null, [profile, settings]);
 
-  const forceModelRefresh = () => refreshModels(value => value + 1);
   const patchSettings = (patch: Partial<RuntimeSettings>) => setSettings(value => ({...value, ...patch}));
 
-  const runModelAction = (action: () => void, done: string) => {
+  const refreshRuntimeState = useCallback(async () => {
     try {
-      action();
+      setModels(await modelManager.listInstalled());
+      setStorageUsedGB(await modelManager.getStorageUsageGB());
+      if (recommendation) {
+        setDiagnostics(await getRuntimeDiagnostics(recommendation));
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [recommendation]);
+
+  useEffect(() => {
+    refreshRuntimeState();
+    const progressSub = DeviceEventEmitter.addListener('local_ai_model_progress', () => {
+      refreshRuntimeState();
+    });
+    const doneSub = DeviceEventEmitter.addListener('local_ai_done', () => {
+      refreshRuntimeState();
+    });
+    return () => {
+      progressSub.remove();
+      doneSub.remove();
+    };
+  }, [refreshRuntimeState]);
+
+  const getState = (modelId: string): InstalledModel => models.find(item => item.modelId === modelId) ?? {
+    modelId,
+    status: 'not_installed',
+    progress: 0,
+    active: false,
+    installedSizeGB: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+  };
+
+  const runModelAction = async (modelId: string, action: () => Promise<void>, done: string) => {
+    setBusyModelId(modelId);
+    try {
+      await action();
       setMessage(done);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
-      forceModelRefresh();
+      setBusyModelId(null);
+      await refreshRuntimeState();
+    }
+  };
+
+  const runLocalTest = async () => {
+    if (!testPrompt.trim()) return;
+    setTestResult('Loading local runtime...');
+    try {
+      const {MediaPipeRuntime} = await import('./src/localAiRuntime');
+      const runtimeAdapter = new MediaPipeRuntime();
+      if (!profile) throw new Error('Device profile is not available.');
+      await runtimeAdapter.initialize(profile);
+      await runtimeAdapter.loadModel(selectedModel);
+      setTestResult('Generating locally...');
+      const result = await runtimeAdapter.generate({prompt: testPrompt.trim(), maxTokens: 256, temperature: 0.3});
+      setTestResult(result.text || '(empty response)');
+      await refreshRuntimeState();
+    } catch (error) {
+      setTestResult(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -261,7 +323,7 @@ function RuntimeSettingsScreen({
     <View style={runtime.container}>
       <Text style={runtime.heading}>AI Runtime</Text>
       <Text style={runtime.body}>
-        Local inference is scaffolded here. Provider binaries and real model downloads are intentionally not wired yet.
+        Local inference runs through the ModelRuntime abstraction. MediaPipe is preferred on Android and model files stay inside Jarvis private app storage.
       </Text>
 
       <RuntimeSection title="Device Information">
@@ -288,11 +350,12 @@ function RuntimeSettingsScreen({
             onPress={() => {
               setSelectedModelId(recommendation.model.id);
               runModelAction(
-                () => modelManager.beginDownload(recommendation.model.id),
-                'Download queued. Real binary download is not implemented yet.',
+                recommendation.model.id,
+                () => modelManager.install(recommendation.model).then(() => undefined),
+                'Download started. Jarvis will validate and install it inside private app storage.',
               );
             }}>
-            <Text style={runtime.primaryButtonText}>Prepare Download</Text>
+            <Text style={runtime.primaryButtonText}>Download Recommended Model</Text>
           </Pressable>
         </RuntimeSection>
       )}
@@ -318,9 +381,13 @@ function RuntimeSettingsScreen({
       </RuntimeSection>
 
       <RuntimeSection title="Installed Models">
-        <RuntimeRow label="Storage Used" value={`${modelManager.getStorageUsageGB().toFixed(1)} GB`} />
+        <RuntimeRow label="Storage Used" value={`${storageUsedGB.toFixed(1)} GB`} />
         {MODEL_REGISTRY.map(model => {
-          const state = modelManager.getModelState(model.id);
+          const state = getState(model.id);
+          const canDownload = state.status === 'not_installed' || state.status === 'failed';
+          const canResume = state.status === 'paused';
+          const canDelete = state.status !== 'not_installed';
+          const isReady = state.status === 'ready' || state.status === 'loaded';
           return (
             <Pressable key={model.id} style={[runtime.modelCard, selectedModelId === model.id && runtime.modelCardActive]} onPress={() => setSelectedModelId(model.id)}>
               <View style={runtime.modelCardTop}>
@@ -328,14 +395,41 @@ function RuntimeSettingsScreen({
                 <Text style={runtime.modelStatus}>{state.active ? 'Active' : statusLabel(state.status)}</Text>
               </View>
               <Text style={runtime.modelMeta}>{model.installedSizeGB} GB - {runtimeLabel(model.runtime)} - {model.parameters}</Text>
+              {(state.status === 'downloading' || state.status === 'installing' || state.status === 'paused') && (
+                <Text style={runtime.progressText}>{state.progress}% - {formatBytes(state.downloadedBytes)} / {formatBytes(state.totalBytes || model.downloadSizeGB * 1024 * 1024 * 1024)}</Text>
+              )}
+              {!!state.error && <Text style={runtime.errorText}>{state.error}</Text>}
               <View style={runtime.modelActions}>
-                <SmallAction label={state.status === 'paused' ? 'Resume' : 'Download'} onPress={() => runModelAction(
-                  () => state.status === 'paused' ? modelManager.resumeDownload(model.id) : modelManager.beginDownload(model.id),
-                  state.status === 'paused' ? 'Download resumed in the queue.' : 'Download queued. Real binary download is not implemented yet.',
-                )} />
-                <SmallAction label="Pause" onPress={() => runModelAction(() => modelManager.pauseDownload(model.id), 'Download paused.')} />
-                <SmallAction label="Delete" danger onPress={() => runModelAction(() => modelManager.deleteModel(model.id), 'Model entry deleted and storage accounting cleared.')} />
-                <SmallAction label="Switch" onPress={() => runModelAction(() => modelManager.switchActiveModel(model.id), 'Active model switched.')} />
+                <SmallAction
+                  label={busyModelId === model.id ? 'Working' : canResume ? 'Resume' : 'Download'}
+                  disabled={busyModelId === model.id || (!canDownload && !canResume)}
+                  onPress={() => runModelAction(
+                    model.id,
+                    () => (canResume ? modelManager.resumeDownload(model) : modelManager.install(model)).then(() => undefined),
+                    canResume ? 'Download resumed.' : 'Download started.',
+                  )}
+                />
+                <SmallAction
+                  label="Pause"
+                  disabled={state.status !== 'downloading'}
+                  onPress={() => runModelAction(model.id, () => modelManager.pauseDownload(model.id).then(() => undefined), 'Download paused.')}
+                />
+                <SmallAction
+                  label="Cancel"
+                  disabled={state.status !== 'downloading' && state.status !== 'paused'}
+                  onPress={() => runModelAction(model.id, () => modelManager.cancelDownload(model.id).then(() => undefined), 'Download cancelled.')}
+                />
+                <SmallAction
+                  label="Delete"
+                  danger
+                  disabled={!canDelete}
+                  onPress={() => runModelAction(model.id, () => modelManager.deleteModel(model.id), 'Model deleted from private app storage.')}
+                />
+                <SmallAction
+                  label="Switch"
+                  disabled={!isReady}
+                  onPress={() => runModelAction(model.id, () => modelManager.switchActiveModel(model.id).then(() => undefined), 'Active model switched.')}
+                />
               </View>
             </Pressable>
           );
@@ -344,6 +438,21 @@ function RuntimeSettingsScreen({
       </RuntimeSection>
 
       <ModelDetails model={selectedModel} />
+
+      <RuntimeSection title="Offline Test Prompt">
+        <TextInput
+          style={dev.input}
+          placeholder="Ask the local model something..."
+          placeholderTextColor="#666"
+          value={testPrompt}
+          onChangeText={setTestPrompt}
+          multiline
+        />
+        <Pressable style={runtime.primaryButton} onPress={runLocalTest}>
+          <Text style={runtime.primaryButtonText}>Load and Generate Offline</Text>
+        </Pressable>
+        {!!testResult && <Text style={runtime.message}>{testResult}</Text>}
+      </RuntimeSection>
 
       <RuntimeSection title="Benchmark">
         <RuntimeRow label="Prompt Evaluation" value="Pending runtime provider" />
@@ -405,9 +514,9 @@ function ToggleRow({label, value, onPress}: {label: string; value: boolean; onPr
   );
 }
 
-function SmallAction({label, onPress, danger}: {label: string; onPress: () => void; danger?: boolean}): React.JSX.Element {
+function SmallAction({label, onPress, danger, disabled}: {label: string; onPress: () => void; danger?: boolean; disabled?: boolean}): React.JSX.Element {
   return (
-    <Pressable style={[runtime.smallButton, danger && runtime.dangerButton]} onPress={onPress}>
+    <Pressable style={[runtime.smallButton, danger && runtime.dangerButton, disabled && runtime.disabledButton]} disabled={disabled} onPress={onPress}>
       <Text style={[runtime.smallButtonText, danger && runtime.dangerText]}>{label}</Text>
     </Pressable>
   );
@@ -446,6 +555,13 @@ function runtimeLabel(value: string): string {
 
 function statusLabel(status: string): string {
   return status.replace(/_/g, ' ').replace(/^./, char => char.toUpperCase());
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return '0 MB';
+  const gb = bytes / 1024 / 1024 / 1024;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${Math.round(bytes / 1024 / 1024)} MB`;
 }
 
 function DevScreen({connection, permissions}: {connection: string; permissions: PermissionStatus}): React.JSX.Element {
@@ -656,6 +772,8 @@ const runtime = StyleSheet.create({
   modelTitle: {fontSize: 14, fontWeight: '700', color: '#24221D', flex: 1},
   modelStatus: {fontSize: 11, color: '#5A554D', fontWeight: '700'},
   modelMeta: {fontSize: 12, color: '#716B61', marginTop: 4},
+  progressText: {fontSize: 11, color: '#2A4FD4', marginTop: 5, fontVariant: ['tabular-nums']},
+  errorText: {fontSize: 11, color: '#8B3A3A', marginTop: 5, lineHeight: 16},
   modelActions: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10},
   smallButton: {borderWidth: 1, borderColor: '#BBB4A7', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7},
   dangerButton: {borderColor: '#A76666'},

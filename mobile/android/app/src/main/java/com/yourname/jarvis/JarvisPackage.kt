@@ -7,7 +7,12 @@ import com.facebook.react.uimanager.ViewManager
 
 class JarvisPackage : ReactPackage {
   override fun createNativeModules(context: ReactApplicationContext): List<NativeModule> =
-    listOf(AccessibilityModule(context), TelephonyModule(context), DeviceModule(context))
+    listOf(
+      AccessibilityModule(context),
+      TelephonyModule(context),
+      DeviceModule(context),
+      LocalAiRuntimeModule(context),
+    )
 
   override fun createViewManagers(context: ReactApplicationContext): List<ViewManager<*, *>> = emptyList()
 }
