@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type {ContentBlockParam, MessageParam} from '@anthropic-ai/sdk/resources/messages';
 import {GoogleGenAI} from '@google/genai';
 import {agentActionSchema, type AgentAction, type ScreenState} from './protocol.js';
+import {logEvent} from './logger.js';
 
 export interface HistoryStep {
   action: AgentAction;
@@ -16,6 +17,7 @@ Available actions:
 {"action":"type","text":"Hello","status":"Entering the requested text","progress":60}
 {"action":"find_and_tap","targetText":"Send","status":"Finding the Send button","progress":75}
 {"action":"swipe","x1":0,"y1":800,"x2":0,"y2":200,"status":"Looking further down the page","progress":45}
+{"action":"list_apps","status":"Checking installed apps","progress":5}
 {"action":"open_app","packageName":"com.whatsapp","status":"Opening WhatsApp","progress":20}
 {"action":"call","number":"+91...","status":"Starting the requested call","progress":90}
 {"action":"get_recent_calls","limit":10,"status":"Checking recent calls","progress":55}
@@ -34,7 +36,10 @@ Rules:
 - If blocked by a lock screen, biometric/PIN prompt, FLAG_SECURE screen, missing permission, or repeated failure, return task_failed.
 - Keep calls and messages exactly within the user's stated intent.
 - For call-log results, Android call types are: 1 incoming, 2 outgoing, 3 missed, 4 voicemail, 5 rejected, 6 blocked, 7 answered externally.
-- Use recentPhoneEvents for recent notification-based questions. WhatsApp consumer notifications use package com.whatsapp and WhatsApp Business uses com.whatsapp.w4b.`;
+- Use recentPhoneEvents for recent notification-based questions. WhatsApp consumer notifications use package com.whatsapp and WhatsApp Business uses com.whatsapp.w4b.
+- When you need to open an app but are unsure of its package name, use list_apps first to discover installed apps, then use open_app with the correct packageName from the results.
+- To read browser history: first use list_apps to find which browser is installed, then open it using open_app, then tap the three-dot menu (contentDescription "More options"), then tap "History", then read the visible entries from the node tree and report them in task_complete.
+- The three-dot menu in Chrome is usually a node with contentDescription "More options". Use find_and_tap with targetText "More options" to open it.`;
 
 function parseJsonObject(text: string): unknown {
   const trimmed = text.trim();
@@ -97,12 +102,14 @@ export class AndroidAgent {
       });
     }
 
+    await logEvent({kind: 'llm_request', provider: this.provider, model: this.model, instruction, historyLength: history.length, packageName: screen.packageName});
+
     let text: string;
     if (this.provider === 'anthropic') {
       const messages: MessageParam[] = [{role: 'user', content}];
       const response = await this.anthropic!.messages.create({
         model: this.model,
-        max_tokens: 512,
+        max_tokens: 1024,
         temperature: 0,
         system: SYSTEM_PROMPT,
         messages,
@@ -128,7 +135,7 @@ export class AndroidAgent {
         contents: [{role: 'user', parts}],
         config: {
           systemInstruction: SYSTEM_PROMPT,
-          maxOutputTokens: 512,
+          maxOutputTokens: 1024,
           temperature: 0,
           responseMimeType: 'application/json',
         },
@@ -136,6 +143,12 @@ export class AndroidAgent {
       text = response.text ?? '';
     }
 
-    return agentActionSchema.parse(parseJsonObject(text));
+    await logEvent({kind: 'llm_response', provider: this.provider, model: this.model, raw: text});
+    try {
+      return agentActionSchema.parse(parseJsonObject(text));
+    } catch (error) {
+      console.error('[agent] parse error — raw response:', text);
+      throw error;
+    }
   }
 }

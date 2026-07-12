@@ -151,11 +151,20 @@ class JarvisForegroundService : Service() {
     fun finish(result: String) = handler.postDelayed({ sendScreenState(result) }, 450)
     try {
       when (name) {
+        "list_apps" -> {
+          val apps = JSONArray()
+          packageManager.getInstalledPackages(0).forEach { pkg ->
+            val label = runCatching { packageManager.getApplicationLabel(pkg.applicationInfo!!).toString() }.getOrDefault(pkg.packageName)
+            apps.put(JSONObject().put("packageName", pkg.packageName).put("label", label))
+          }
+          finish("success: $apps")
+        }
         "open_app" -> {
           val target = action.getString("packageName")
-          val launch = packageManager.getLaunchIntentForPackage(target) ?: throw IllegalStateException("App not found: $target")
-          launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-          startActivity(launch)
+          val launchIntent = packageManager.getLaunchIntentForPackage(target)
+            ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://")).apply { `package` = target }
+          launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          startActivity(launchIntent)
           finish("success")
         }
         "tap" -> serviceOrThrow(service).tap(action.getInt("x"), action.getInt("y")) { finish(if (it) "success" else "failed: Tap was rejected") }
