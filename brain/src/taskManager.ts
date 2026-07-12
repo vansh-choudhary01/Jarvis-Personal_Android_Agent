@@ -51,6 +51,7 @@ export class TaskManager {
       actionCount: 0,
     };
     await logEvent({kind: 'task_started', taskId: id, instruction});
+    this.send({type: 'task_status', status: 'started', detail: instruction});
     this.send({type: 'request_screen_state'});
     return id;
   }

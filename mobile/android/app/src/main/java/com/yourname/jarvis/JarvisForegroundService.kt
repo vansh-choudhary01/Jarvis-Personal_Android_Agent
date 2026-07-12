@@ -122,7 +122,12 @@ class JarvisForegroundService : Service() {
     }
     when (message.optString("type")) {
       "request_screen_state" -> handler.post { sendScreenState(null) }
-      "task_status" -> emitStatus(message.optString("detail", message.optString("status")))
+      "task_status" -> {
+        val status = message.optString("status")
+        val detail = message.optString("detail", status)
+        if (status == "started") JarvisAccessibilityService.instance?.overlayTaskStarted(detail)
+        emitStatus(detail)
+      }
       "action" -> handler.post { execute(message) }
     }
   }
@@ -131,9 +136,17 @@ class JarvisForegroundService : Service() {
     val service = JarvisAccessibilityService.instance
     val name = action.optString("action")
     if (name == "task_complete" || name == "task_failed") {
-      emitStatus(if (name == "task_complete") "Complete: ${action.optString("summary")}" else "Failed: ${action.optString("reason")}")
+      val success = name == "task_complete"
+      val detail = if (success) action.optString("summary") else action.optString("reason")
+      JarvisAccessibilityService.instance?.overlayFinished(detail, success)
+      emitStatus(if (success) "Complete: $detail" else "Failed: $detail")
       return
     }
+    JarvisAccessibilityService.instance?.overlayAction(
+      name,
+      action.optString("status").takeIf(String::isNotBlank),
+      if (action.has("progress")) action.optInt("progress") else null,
+    )
 
     fun finish(result: String) = handler.postDelayed({ sendScreenState(result) }, 450)
     try {
@@ -220,6 +233,7 @@ class JarvisForegroundService : Service() {
 
   private fun emitStatus(status: String) {
     currentStatus = status
+    JarvisAccessibilityService.instance?.overlayConnection(status)
     JarvisEventBus.emit("connection_status", Arguments.createMap().apply { putString("status", status) })
   }
 

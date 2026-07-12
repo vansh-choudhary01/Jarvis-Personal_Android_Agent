@@ -7,6 +7,7 @@ import android.graphics.Rect
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.WindowManager
 import com.facebook.react.bridge.Arguments
 import org.json.JSONArray
 import org.json.JSONObject
@@ -18,16 +19,25 @@ class JarvisAccessibilityService : AccessibilityService() {
   }
 
   @Volatile private var latestTree = "[]"
+  private lateinit var overlay: JarvisOverlayController
 
   override fun onServiceConnected() {
     instance = this
+    overlay = JarvisOverlayController(this, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+    overlay.show()
     refreshAndEmit()
   }
+
+  fun overlayTaskStarted(instruction: String) = overlay.taskStarted(instruction)
+  fun overlayAction(action: String, status: String?, progress: Int?) = overlay.action(action, status, progress)
+  fun overlayFinished(message: String, success: Boolean) = overlay.taskFinished(message, success)
+  fun overlayConnection(status: String) = overlay.connection(status)
 
   override fun onAccessibilityEvent(event: AccessibilityEvent?) = refreshAndEmit()
   override fun onInterrupt() = Unit
 
   override fun onDestroy() {
+    if (::overlay.isInitialized) overlay.hide()
     if (instance === this) instance = null
     super.onDestroy()
   }

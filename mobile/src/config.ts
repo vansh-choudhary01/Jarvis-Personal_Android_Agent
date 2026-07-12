@@ -2,7 +2,7 @@ export const JARVIS_CONFIG = {
   // Android emulator: ws://10.0.2.2:3000/phone
   // Physical phone/EC2: wss://your-domain.example/phone
   brainWebSocketUrl: 'ws://127.0.0.1:3000/phone',
-  phoneAuthToken: 'replace-with-the-same-PHONE_AUTH_TOKEN-as-the-brain',
+  phoneAuthToken: 'jarvis-local-emulator-dev-token-2026',
 };
 
 export const isJarvisConfigured =

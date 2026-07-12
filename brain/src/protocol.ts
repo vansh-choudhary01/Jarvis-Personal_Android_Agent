@@ -34,22 +34,27 @@ export const phoneMessageSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
-const tap = z.object({action: z.literal('tap'), x: z.number(), y: z.number()});
-const type = z.object({action: z.literal('type'), text: z.string()});
-const findAndTap = z.object({action: z.literal('find_and_tap'), targetText: z.string()});
+const progressFields = {
+  status: z.string().max(160).optional(),
+  progress: z.number().int().min(0).max(100).optional(),
+};
+const tap = z.object({action: z.literal('tap'), x: z.number(), y: z.number(), ...progressFields});
+const type = z.object({action: z.literal('type'), text: z.string(), ...progressFields});
+const findAndTap = z.object({action: z.literal('find_and_tap'), targetText: z.string(), ...progressFields});
 const swipe = z.object({
   action: z.literal('swipe'),
   x1: z.number(),
   y1: z.number(),
   x2: z.number(),
   y2: z.number(),
+  ...progressFields,
 });
-const openApp = z.object({action: z.literal('open_app'), packageName: z.string()});
-const call = z.object({action: z.literal('call'), number: z.string()});
-const getRecentCalls = z.object({action: z.literal('get_recent_calls'), limit: z.number().int().min(1).max(50)});
-const wait = z.object({action: z.literal('wait'), ms: z.number().int().min(0).max(30_000)});
-const taskComplete = z.object({action: z.literal('task_complete'), summary: z.string()});
-const taskFailed = z.object({action: z.literal('task_failed'), reason: z.string()});
+const openApp = z.object({action: z.literal('open_app'), packageName: z.string(), ...progressFields});
+const call = z.object({action: z.literal('call'), number: z.string(), ...progressFields});
+const getRecentCalls = z.object({action: z.literal('get_recent_calls'), limit: z.number().int().min(1).max(50), ...progressFields});
+const wait = z.object({action: z.literal('wait'), ms: z.number().int().min(0).max(30_000), ...progressFields});
+const taskComplete = z.object({action: z.literal('task_complete'), summary: z.string(), ...progressFields});
+const taskFailed = z.object({action: z.literal('task_failed'), reason: z.string(), ...progressFields});
 
 export const agentActionSchema = z.discriminatedUnion('action', [
   tap,
