@@ -17,10 +17,10 @@ Configure `src/config.ts` with the brain WebSocket URL and the same token as `br
 Map to a short drive to avoid Windows path-length issues, then build:
 
 ```powershell
-subst J: "C:\path\to\jarvis"
+subst J: "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis"
 cd J:\mobile\android
 .\gradlew.bat assembleDebug -PreactNativeArchitectures=arm64-v8a
-adb install -r app\build\outputs\apk\debug\app-debug.apk
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
 Start Metro in a separate terminal (required for debug builds):
@@ -34,8 +34,8 @@ npm.cmd start
 Set ADB port forwarding each session after connecting the phone:
 
 ```powershell
-adb reverse tcp:8081 tcp:8081
-adb reverse tcp:3000 tcp:3000
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8081 tcp:8081
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:3000 tcp:3000
 ```
 
 Complete Accessibility, notification access, call/SMS/runtime permissions, and battery exemption in the onboarding screen.

@@ -124,10 +124,10 @@ npm.cmd start
 In another terminal, build and install the APK. Long Windows paths break React Native's C++ build, so map the project to a short drive first:
 
 ```powershell
-subst J: "C:\path\to\jarvis"
+subst J: "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis"
 cd J:\mobile\android
 .\gradlew.bat assembleDebug -PreactNativeArchitectures=arm64-v8a
-adb install -r app\build\outputs\apk\debug\app-debug.apk
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
 Or use `installDebug` if the device is already connected and ADB forwarding is active:
@@ -138,8 +138,8 @@ Or use `installDebug` if the device is already connected and ADB forwarding is a
 
 > ADB port forwarding must be set each session (after every USB reconnect or reboot):
 > ```powershell
-> adb reverse tcp:8081 tcp:8081
-> adb reverse tcp:3000 tcp:3000
+> & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8081 tcp:8081
+> & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:3000 tcp:3000
 > ```
 
 ## 4. Grant one-time phone permissions
@@ -160,12 +160,23 @@ Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:3000/task" `
   -Headers @{
-    Authorization = "Bearer YOUR_PHONE_AUTH_TOKEN"
+    Authorization = "Bearer $((Get-Content brain\.env | Select-String 'PHONE_AUTH_TOKEN=(.+)').Matches[0].Groups[1].Value)"
     "Content-Type" = "application/json"
   } `
   -Body (@{
     instruction = "Open Settings and tell me the Android version"
   } | ConvertTo-Json)
+```
+
+Or set the token explicitly (must match `PHONE_AUTH_TOKEN` in `brain/.env`):
+
+```powershell
+$token = "your-token-here"
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:3000/task" `
+  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+  -Body (@{ instruction = "Open Settings and tell me the Android version" } | ConvertTo-Json)
 ```
 
 The response `status: accepted` means the task started, not that it finished. Watch the Jarvis connection card or `brain/logs/actions.jsonl` for `task_finished`.
