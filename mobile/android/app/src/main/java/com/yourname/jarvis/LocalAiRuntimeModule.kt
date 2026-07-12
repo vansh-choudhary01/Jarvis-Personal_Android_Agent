@@ -1,9 +1,14 @@
 package com.yourname.jarvis
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Debug
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.BaseActivityEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -18,6 +23,7 @@ import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.lang.reflect.Proxy
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -27,6 +33,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 class LocalAiRuntimeModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
+  private val importRequestCode = 9217
   private val prefs = context.getSharedPreferences("jarvis_local_ai_runtime", Context.MODE_PRIVATE)
   private val client = OkHttpClient.Builder().retryOnConnectionFailure(true).build()
   private val worker = Executors.newSingleThreadExecutor()
@@ -45,6 +52,28 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   private var loadTimeMs = 0L
   private var temperature = 0.3
   private var peakMemoryBytes = 0L
+  private var pendingImportPromise: Promise? = null
+  private var pendingImportModel: ModelRequest? = null
+
+  private val activityListener = object : BaseActivityEventListener() {
+    override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
+      if (requestCode != importRequestCode) return
+      val promise = pendingImportPromise ?: return
+      val model = pendingImportModel
+      pendingImportPromise = null
+      pendingImportModel = null
+
+      if (resultCode != Activity.RESULT_OK || data?.data == null || model == null) {
+        promise.reject("IMPORT_CANCELLED", "Model import was cancelled.")
+        return
+      }
+      importModelUri(model, data.data!!, promise)
+    }
+  }
+
+  init {
+    context.addActivityEventListener(activityListener)
+  }
 
   override fun getName(): String = "JarvisLocalAiRuntime"
 
@@ -110,17 +139,79 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   }
 
   @ReactMethod
+  fun getHuggingFaceTokenConfigured(promise: Promise) {
+    promise.resolve(!prefs.getString("huggingface_token", "").isNullOrBlank())
+  }
+
+  @ReactMethod
+  fun setHuggingFaceToken(token: String, promise: Promise) {
+    val clean = token.trim()
+    if (!clean.startsWith("hf_")) {
+      promise.reject("INVALID_HF_TOKEN", "Hugging Face token should start with hf_.")
+      return
+    }
+    prefs.edit().putString("huggingface_token", clean).apply()
+    promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun clearHuggingFaceToken(promise: Promise) {
+    prefs.edit().remove("huggingface_token").apply()
+    promise.resolve(true)
+  }
+
+  @ReactMethod
   fun downloadModel(model: ReadableMap, promise: Promise) {
     val request = ModelRequest.from(model)
     if (request.downloadUrl.isBlank()) {
       modelDir(request.id).mkdirs()
-      setFailure(request.id, "No direct MediaPipe .task download URL is configured for this model yet.")
-      emitProgress(request, "failed", 0, 0, 0, "No direct MediaPipe .task download URL is configured for this model yet.")
-      promise.reject("MODEL_URL_MISSING", "No direct MediaPipe .task download URL is configured for this model yet.")
+      if (request.licenseRequired) {
+        setFailure(request.id, "This official Google model requires license acceptance before download. Open the model page, accept the license, download the .${request.format} file, then import it here.", "needs_license_acceptance")
+        emitProgress(request, "needs_license_acceptance", 0, 0, 0, "License acceptance is required before Jarvis can import this model.")
+        promise.reject("LICENSE_REQUIRED", "This model requires license acceptance. Open the model page, download the .${request.format} file, then import it in Jarvis.")
+      } else {
+        setFailure(request.id, "No direct MediaPipe .task/.litertlm download URL is configured for this model yet.", "missing")
+        emitProgress(request, "missing", 0, 0, 0, "No direct MediaPipe .task/.litertlm download URL is configured for this model yet.")
+        promise.reject("MODEL_URL_MISSING", "No direct MediaPipe .task/.litertlm download URL is configured for this model yet.")
+      }
       return
     }
     startDownload(request)
     promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun openModelPage(url: String, promise: Promise) {
+    try {
+      val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      context.startActivity(intent)
+      promise.resolve(true)
+    } catch (error: Throwable) {
+      promise.reject("OPEN_MODEL_PAGE_FAILED", "Could not open model page: ${error.message ?: error.javaClass.simpleName}", error)
+    }
+  }
+
+  @ReactMethod
+  fun importModelFromPicker(model: ReadableMap, promise: Promise) {
+    val activity = reactApplicationContext.currentActivity
+    if (activity == null) {
+      promise.reject("NO_ACTIVITY", "Jarvis must be open to import a model.")
+      return
+    }
+    if (pendingImportPromise != null) {
+      promise.reject("IMPORT_IN_PROGRESS", "Another model import is already waiting for a file.")
+      return
+    }
+    val request = ModelRequest.from(model)
+    pendingImportPromise = promise
+    pendingImportModel = request
+    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+      addCategory(Intent.CATEGORY_OPENABLE)
+      type = "*/*"
+      putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/octet-stream", "application/x-mediapipe-model", "application/x-litertlm"))
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    activity.startActivityForResult(intent, importRequestCode)
   }
 
   @ReactMethod
@@ -167,6 +258,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       try {
         val file = finalFile(request)
         if (!file.exists()) {
+          setFailure(request.id, "Model file is missing from private storage.", "missing")
           promise.reject("MODEL_MISSING", "Model is not installed: ${request.displayName}")
           return@execute
         }
@@ -193,6 +285,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     worker.execute {
       try {
         val model = ensureLoaded(maxTokens, temp)
+        setStatus(model.id, "running")
         val started = SystemClock.elapsedRealtime()
         cancelled.set(false)
         promptTokens = estimateTokens(prompt)
@@ -206,6 +299,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         map.putString("text", text)
         map.putString("modelId", model.id)
         map.putInt("tokensGenerated", generatedTokens)
+        setStatus(model.id, "loaded")
         promise.resolve(map)
       } catch (error: Throwable) {
         promise.reject("GENERATION_FAILED", "Local generation failed: ${error.message ?: error.javaClass.simpleName}", error)
@@ -284,8 +378,14 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       val downloaded = if (part.exists()) part.length() else 0L
       val requestBuilder = Request.Builder().url(model.downloadUrl)
       if (downloaded > 0L) requestBuilder.addHeader("Range", "bytes=$downloaded-")
+      prefs.getString("huggingface_token", null)?.takeIf { it.isNotBlank() }?.let {
+        requestBuilder.addHeader("Authorization", "Bearer $it")
+      }
       try {
         client.newCall(requestBuilder.build()).also { downloads[model.id] = it }.execute().use { response ->
+          if (response.code == 401 || response.code == 403) {
+            throw LicenseRequiredException("Hugging Face blocked this gated model. Accept the model license and save a Hugging Face access token in Jarvis, then tap Download again.")
+          }
           if (!response.isSuccessful && response.code != 206) {
             throw IllegalStateException("Download failed with HTTP ${response.code}")
           }
@@ -320,15 +420,103 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
             part.copyTo(installed, overwrite = true)
             part.delete()
           }
-          setStatus(model.id, "ready")
+          benchmarkAndValidate(model, installed)
           emitProgress(model, "ready", installed.length(), total, 100, null)
         }
       } catch (error: Throwable) {
         if (paused[model.id]?.get() == true) return@execute
-        setFailure(model.id, error.message ?: error.javaClass.simpleName)
+        val message = error.message ?: error.javaClass.simpleName
+        val status = when {
+          error is LicenseRequiredException -> "needs_license_acceptance"
+          message.contains("Checksum", ignoreCase = true) -> "corrupted"
+          else -> "failed"
+        }
+        setFailure(model.id, message, status)
         emitProgress(model, "failed", part.length(), expectedBytes(model.id), progressFor(model.id), error.message)
       } finally {
         downloads.remove(model.id)
+      }
+    }
+  }
+
+  private fun importModelUri(model: ModelRequest, uri: Uri, promise: Promise) {
+    worker.execute {
+      val displayName = displayNameForUri(uri)
+      val extension = displayName.substringAfterLast('.', "").lowercase(Locale.US)
+      if (extension != "task" && extension != "litertlm") {
+        modelDir(model.id).mkdirs()
+        setFailure(model.id, "Unsupported model format .$extension. Jarvis only accepts MediaPipe .task or LiteRT-LM .litertlm files.", "unsupported")
+        promise.reject("UNSUPPORTED_MODEL_FORMAT", "Unsupported model format .$extension. Select a .task or .litertlm file.")
+        return@execute
+      }
+
+      try {
+        modelDir(model.id).mkdirs()
+        setStatus(model.id, "installing")
+        val target = finalFile(model)
+        if (target.exists()) target.delete()
+        context.contentResolver.openInputStream(uri).use { input ->
+          if (input == null) throw IllegalStateException("Could not open selected model file")
+          target.outputStream().use { output -> input.copyTo(output) }
+        }
+        prefs.edit()
+          .putLong("${model.id}:expected_bytes", target.length())
+          .putString("${model.id}:file_name", model.fileName)
+          .putString("${model.id}:format", extension)
+          .putString("${model.id}:imported_file_name", displayName)
+          .putString("${model.id}:storage_path", target.absolutePath)
+          .remove("${model.id}:error")
+          .apply()
+        validateChecksumIfConfigured(model, target)
+        benchmarkAndValidate(model.copy(format = extension), target)
+        promise.resolve(stateMap(model.id))
+      } catch (error: Throwable) {
+        val message = error.message ?: error.javaClass.simpleName
+        setFailure(model.id, "Invalid model: $message", if (message.contains("Checksum", ignoreCase = true)) "corrupted" else "invalid_model")
+        promise.reject("MODEL_IMPORT_FAILED", "Model import failed: $message", error)
+      }
+    }
+  }
+
+  private fun benchmarkAndValidate(model: ModelRequest, file: File) {
+    setStatus(model.id, "benchmarking")
+    val initializedAt = SystemClock.elapsedRealtime()
+    val beforeLoad = Debug.getNativeHeapAllocatedSize()
+    val inference = try {
+      createMediaPipeInference(file.absolutePath, 128, 0.3f)
+    } catch (error: Throwable) {
+      setFailure(model.id, "Unsupported or invalid model: ${error.message ?: error.javaClass.simpleName}", "invalid_model")
+      throw error
+    }
+    val loadMs = SystemClock.elapsedRealtime() - initializedAt
+    try {
+      val generationStarted = SystemClock.elapsedRealtime()
+      val text = inference.javaClass.getMethod("generateResponse", String::class.java).invoke(inference, "Hello")?.toString() ?: ""
+      val totalMs = max(1L, SystemClock.elapsedRealtime() - generationStarted)
+      val tokens = estimateTokens(text)
+      val currentRam = Debug.getNativeHeapAllocatedSize()
+      val peak = max(peakMemoryBytes, max(beforeLoad, currentRam))
+      peakMemoryBytes = peak
+      promptTokens = 1
+      generatedTokens = tokens
+      loadTimeMs = loadMs
+      timeToFirstTokenMs = totalMs
+      generationSpeed = tokens * 1000.0 / totalMs
+      val benchmarkJson = """
+        {"loadTimeMs":$loadMs,"timeToFirstTokenMs":$totalMs,"tokensPerSecond":$generationSpeed,"peakRamBytes":$peak,"currentRamBytes":$currentRam,"backend":"MediaPipe Auto","initializationTimeMs":$loadMs,"generatedTokens":$tokens,"validatedAt":"${Instant.now()}"}
+      """.trimIndent()
+      prefs.edit()
+        .putString("${model.id}:benchmark_json", benchmarkJson)
+        .putString("${model.id}:format", model.format)
+        .putString("${model.id}:storage_path", file.absolutePath)
+        .putString("active_model_id", model.id)
+        .apply()
+      setStatus(model.id, "ready")
+    } finally {
+      try {
+        inference.javaClass.methods.firstOrNull { it.name == "close" && it.parameterCount == 0 }?.invoke(inference)
+      } catch (_: Throwable) {
+        // Ignore close failures after validation.
       }
     }
   }
@@ -399,7 +587,17 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     if (llm != null && model != null) return model
     val activeId = prefs.getString("active_model_id", null) ?: throw IllegalStateException("No active model is selected")
     val fileName = prefs.getString("${activeId}:file_name", "$activeId.task") ?: "$activeId.task"
-    val request = ModelRequest(activeId, activeId, "", fileName, "", expectedBytes(activeId))
+    val request = ModelRequest(
+      activeId,
+      activeId,
+      "",
+      "",
+      fileName,
+      prefs.getString("${activeId}:format", fileName.substringAfterLast('.', "task")) ?: "task",
+      "",
+      expectedBytes(activeId),
+      false,
+    )
     val final = finalFile(request)
     if (!final.exists()) throw IllegalStateException("Active model file is missing")
     llm = createMediaPipeInference(final.absolutePath, maxTokens, temp.toFloat())
@@ -460,6 +658,10 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     map.putDouble("installedSizeBytes", if (final.exists()) final.length().toDouble() else 0.0)
     map.putDouble("downloadedBytes", downloaded.toDouble())
     map.putDouble("totalBytes", expected.toDouble())
+    map.putString("format", prefs.getString("${modelId}:format", final.extension.lowercase(Locale.US)))
+    map.putString("storagePath", prefs.getString("${modelId}:storage_path", final.absolutePath))
+    map.putString("importedFileName", prefs.getString("${modelId}:imported_file_name", null))
+    map.putString("benchmarkJson", prefs.getString("${modelId}:benchmark_json", null))
     prefs.getString("${modelId}:error", null)?.let { map.putString("error", it) }
     return map
   }
@@ -472,7 +674,8 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     map.putString("provider", "mediapipe")
     map.putString("currentModel", model?.displayName ?: "")
     map.putInt("contextLength", 8192)
-    map.putString("inferenceDevice", "Auto")
+    map.putString("inferenceDevice", "MediaPipe Auto")
+    map.putString("backend", "MediaPipe Auto")
     map.putString("accelerator", "MediaPipe backend selection")
     map.putDouble("memoryUsageBytes", usedBytes.toDouble())
     map.putDouble("peakMemoryBytes", max(peakMemoryBytes, usedBytes).toDouble())
@@ -486,6 +689,10 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     map.putString("cpuUsage", "Process CPU not sampled")
     map.putDouble("timeToFirstTokenMs", timeToFirstTokenMs.toDouble())
     map.putDouble("loadTimeMs", loadTimeMs.toDouble())
+    map.putDouble("initializationTimeMs", loadTimeMs.toDouble())
+    map.putString("modelFormat", model?.format ?: "")
+    map.putString("storagePath", model?.let { finalFile(it).absolutePath } ?: "")
+    map.putBoolean("streamingEnabled", true)
     return map
   }
 
@@ -539,17 +746,24 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   private fun expectedBytes(modelId: String): Long = prefs.getLong("${modelId}:expected_bytes", 0L)
   private fun getStatus(modelId: String): String = prefs.getString("${modelId}:status", null) ?: inferStatus(modelId)
   private fun setStatus(modelId: String, status: String) = prefs.edit().putString("${modelId}:status", status).remove("${modelId}:error").apply()
-  private fun setFailure(modelId: String, error: String) = prefs.edit().putString("${modelId}:status", "failed").putString("${modelId}:error", error).apply()
+  private fun setFailure(modelId: String, error: String, status: String = "failed") =
+    prefs.edit().putString("${modelId}:status", status).putString("${modelId}:error", error).apply()
   private fun clearModelPrefs(modelId: String) = prefs.edit()
     .remove("${modelId}:status")
     .remove("${modelId}:error")
     .remove("${modelId}:expected_bytes")
     .remove("${modelId}:file_name")
+    .remove("${modelId}:format")
+    .remove("${modelId}:imported_file_name")
+    .remove("${modelId}:storage_path")
+    .remove("${modelId}:benchmark_json")
     .apply()
 
   private fun inferStatus(modelId: String): String {
     val dir = modelDir(modelId)
-    val hasTask = dir.listFiles()?.any { it.isFile && it.extension.lowercase(Locale.US) == "task" } == true
+    val hasTask = dir.listFiles()?.any {
+      it.isFile && (it.extension.lowercase(Locale.US) == "task" || it.extension.lowercase(Locale.US) == "litertlm")
+    } == true
     return if (hasTask) "ready" else "not_installed"
   }
 
@@ -571,6 +785,16 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
 
   private fun estimateTokens(text: String): Int = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }.size
 
+  private fun displayNameForUri(uri: Uri): String {
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+      if (cursor.moveToFirst()) {
+        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (index >= 0) return cursor.getString(index)
+      }
+    }
+    return uri.lastPathSegment ?: "selected-model"
+  }
+
   private fun snapshotPeakMemory() {
     peakMemoryBytes = max(peakMemoryBytes, Debug.getNativeHeapAllocatedSize())
   }
@@ -579,9 +803,12 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     val id: String,
     val displayName: String,
     val downloadUrl: String,
+    val modelPageUrl: String,
     val fileName: String,
+    val format: String,
     val checksumSha256: String,
     val expectedSizeBytes: Long,
+    val licenseRequired: Boolean,
   ) {
     companion object {
       fun from(map: ReadableMap): ModelRequest {
@@ -591,13 +818,18 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
           id = id,
           displayName = map.getString("displayName") ?: id,
           downloadUrl = map.getString("downloadUrl") ?: "",
+          modelPageUrl = map.getString("modelPageUrl") ?: "",
           fileName = fileName,
+          format = map.getString("format") ?: fileName.substringAfterLast('.', "task"),
           checksumSha256 = map.getString("checksumSha256") ?: "",
           expectedSizeBytes = if (map.hasKey("expectedSizeBytes")) map.getDouble("expectedSizeBytes").toLong() else 0L,
+          licenseRequired = map.hasKey("licenseRequired") && map.getBoolean("licenseRequired"),
         )
       }
 
-      fun placeholder(modelId: String) = ModelRequest(modelId, modelId, "", "$modelId.task", "", 0L)
+      fun placeholder(modelId: String) = ModelRequest(modelId, modelId, "", "", "$modelId.task", "task", "", 0L, false)
     }
   }
+
+  private class LicenseRequiredException(message: String) : Exception(message)
 }

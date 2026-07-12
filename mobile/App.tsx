@@ -23,6 +23,7 @@ import {
   detectRuntimeProviders,
   getRuntimeDiagnostics,
   modelManager,
+  refineRecommendationWithBenchmarks,
   recommendModel,
   type InstalledModel,
   type ModelDefinition,
@@ -233,24 +234,45 @@ function RuntimeSettingsScreen({
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(null);
   const [testPrompt, setTestPrompt] = useState('Say hello from the local offline model in one sentence.');
   const [testResult, setTestResult] = useState('');
+  const [localRunPhase, setLocalRunPhase] = useState<'idle' | 'preparing' | 'loading' | 'thinking' | 'generating' | 'done' | 'failed'>('idle');
+  const [thinkingDots, setThinkingDots] = useState('.');
   const [busyModelId, setBusyModelId] = useState<string | null>(null);
+  const [hfToken, setHfToken] = useState('');
+  const [hfTokenConfigured, setHfTokenConfigured] = useState(false);
   const selectedModel = MODEL_REGISTRY.find(model => model.id === selectedModelId) ?? MODEL_REGISTRY[0]!;
   const detections = useMemo(() => profile ? detectRuntimeProviders(profile) : [], [profile]);
-  const recommendation = useMemo(() => profile ? recommendModel(profile, settings) : null, [profile, settings]);
+  const baseRecommendation = useMemo(() => profile ? recommendModel(profile, settings) : null, [profile, settings]);
+  const recommendation = useMemo(
+    () => baseRecommendation ? refineRecommendationWithBenchmarks(baseRecommendation, models) : null,
+    [baseRecommendation, models],
+  );
 
   const patchSettings = (patch: Partial<RuntimeSettings>) => setSettings(value => ({...value, ...patch}));
+  const localModelBusy = localRunPhase === 'preparing' || localRunPhase === 'loading' || localRunPhase === 'thinking' || localRunPhase === 'generating';
+
+  useEffect(() => {
+    if (!localModelBusy) {
+      setThinkingDots('.');
+      return;
+    }
+    const timer = setInterval(() => {
+      setThinkingDots(value => value.length >= 3 ? '.' : `${value}.`);
+    }, 420);
+    return () => clearInterval(timer);
+  }, [localModelBusy]);
 
   const refreshRuntimeState = useCallback(async () => {
     try {
       setModels(await modelManager.listInstalled());
       setStorageUsedGB(await modelManager.getStorageUsageGB());
-      if (recommendation) {
-        setDiagnostics(await getRuntimeDiagnostics(recommendation));
+      setHfTokenConfigured(await modelManager.isHuggingFaceTokenConfigured());
+      if (baseRecommendation) {
+        setDiagnostics(await getRuntimeDiagnostics(baseRecommendation));
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     }
-  }, [recommendation]);
+  }, [baseRecommendation]);
 
   useEffect(() => {
     refreshRuntimeState();
@@ -291,19 +313,58 @@ function RuntimeSettingsScreen({
 
   const runLocalTest = async () => {
     if (!testPrompt.trim()) return;
-    setTestResult('Loading local runtime...');
+    setLocalRunPhase('preparing');
+    setTestResult('');
     try {
       const {MediaPipeRuntime} = await import('./src/localAiRuntime');
       const runtimeAdapter = new MediaPipeRuntime();
       if (!profile) throw new Error('Device profile is not available.');
+      const started = Date.now();
+      setTestResult('Preparing local-only runtime. Cloud providers are disabled for this check.');
       await runtimeAdapter.initialize(profile);
+      setLocalRunPhase('loading');
+      setTestResult('Loading model into memory...');
       await runtimeAdapter.loadModel(selectedModel);
-      setTestResult('Generating locally...');
-      const result = await runtimeAdapter.generate({prompt: testPrompt.trim(), maxTokens: 256, temperature: 0.3});
-      setTestResult(result.text || '(empty response)');
+      const loadedAt = Date.now();
+      setLocalRunPhase('thinking');
+      setTestResult('Thinking locally...');
+      let streamedText = '';
+      let firstTokenAt = 0;
+      setLocalRunPhase('generating');
+      for await (const token of runtimeAdapter.stream({prompt: testPrompt.trim(), maxTokens: 256, temperature: 0.3})) {
+        if (!firstTokenAt) firstTokenAt = Date.now();
+        streamedText += token;
+        setTestResult(streamedText);
+      }
+      await runtimeAdapter.unload();
+      const finishedAt = Date.now();
+      setLocalRunPhase('done');
+      setTestResult(`Offline OK (${loadedAt - started}ms load, ${firstTokenAt ? firstTokenAt - loadedAt : finishedAt - loadedAt}ms TTFT, ${finishedAt - loadedAt}ms generate): ${streamedText || '(empty response)'}`);
       await refreshRuntimeState();
     } catch (error) {
+      setLocalRunPhase('failed');
       setTestResult(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const saveHuggingFaceToken = async () => {
+    try {
+      await modelManager.setHuggingFaceToken(hfToken);
+      setHfToken('');
+      setHfTokenConfigured(true);
+      setMessage('Hugging Face token saved locally. You can now tap Download for gated models.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const clearHuggingFaceToken = async () => {
+    try {
+      await modelManager.clearHuggingFaceToken();
+      setHfTokenConfigured(false);
+      setMessage('Hugging Face token cleared.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -345,6 +406,7 @@ function RuntimeSettingsScreen({
           <RuntimeRow label="Reason" value={recommendation.reason} />
           <RuntimeRow label="Estimated Storage" value={`${recommendation.model.installedSizeGB} GB`} />
           <RuntimeRow label="Estimated Memory" value={`~${recommendation.estimatedMemoryGB} GB during inference`} />
+          <RuntimeRow label="License" value={recommendation.model.licenseRequired ? 'Accept once, then use saved HF token for one-tap download' : 'Direct download available'} />
           <Pressable
             style={runtime.primaryButton}
             onPress={() => {
@@ -352,13 +414,34 @@ function RuntimeSettingsScreen({
               runModelAction(
                 recommendation.model.id,
                 () => modelManager.install(recommendation.model).then(() => undefined),
-                'Download started. Jarvis will validate and install it inside private app storage.',
+                'Download started. Jarvis picked the exact official model file and will validate it after install.',
               );
             }}>
             <Text style={runtime.primaryButtonText}>Download Recommended Model</Text>
           </Pressable>
         </RuntimeSection>
       )}
+
+      <RuntimeSection title="Hugging Face Access">
+        <RuntimeRow label="Token" value={hfTokenConfigured ? 'Saved locally' : 'Not configured'} />
+        <Text style={runtime.helpText}>
+          Gated Gemma downloads need license acceptance plus a Hugging Face token. Jarvis uses it only to download the exact selected .task/.litertlm file.
+        </Text>
+        <TextInput
+          style={dev.input}
+          placeholder="Paste hf_ token here"
+          placeholderTextColor="#666"
+          value={hfToken}
+          onChangeText={setHfToken}
+          autoCapitalize="none"
+          autoCorrect={false}
+          secureTextEntry
+        />
+        <View style={runtime.modelActions}>
+          <SmallAction label="Save Token" disabled={!hfToken.trim()} onPress={saveHuggingFaceToken} />
+          <SmallAction label="Clear Token" disabled={!hfTokenConfigured} danger onPress={clearHuggingFaceToken} />
+        </View>
+      </RuntimeSection>
 
       <RuntimeSection title="Advanced Settings">
         <ToggleRow label="Automatic Selection" value={settings.automaticSelection} onPress={() => patchSettings({automaticSelection: !settings.automaticSelection})} />
@@ -394,19 +477,32 @@ function RuntimeSettingsScreen({
                 <Text style={runtime.modelTitle}>{model.displayName}</Text>
                 <Text style={runtime.modelStatus}>{state.active ? 'Active' : statusLabel(state.status)}</Text>
               </View>
-              <Text style={runtime.modelMeta}>{model.installedSizeGB} GB - {runtimeLabel(model.runtime)} - {model.parameters}</Text>
+              <Text style={runtime.modelMeta}>{model.installedSizeGB} GB - {runtimeLabel(model.runtime)} - {model.parameters} - .{model.format}</Text>
               {(state.status === 'downloading' || state.status === 'installing' || state.status === 'paused') && (
                 <Text style={runtime.progressText}>{state.progress}% - {formatBytes(state.downloadedBytes)} / {formatBytes(state.totalBytes || model.downloadSizeGB * 1024 * 1024 * 1024)}</Text>
               )}
+              {!!state.benchmark && (
+                <Text style={runtime.progressText}>{state.benchmark.tokensPerSecond.toFixed(1)} tok/s - load {Math.round(state.benchmark.loadTimeMs)}ms - TTFT {Math.round(state.benchmark.timeToFirstTokenMs)}ms</Text>
+              )}
               {!!state.error && <Text style={runtime.errorText}>{state.error}</Text>}
               <View style={runtime.modelActions}>
+                <SmallAction
+                  label="Open License"
+                  disabled={!model.licenseRequired}
+                  onPress={() => runModelAction(model.id, () => modelManager.openModelPage(model), 'Opened official model page. Accept the license there, then return to Jarvis and tap Download.')}
+                />
+                <SmallAction
+                  label="Import Local Model"
+                  disabled={busyModelId === model.id}
+                  onPress={() => runModelAction(model.id, () => modelManager.importFromPicker(model).then(() => undefined), 'Imported, validated, benchmarked, and stored in Jarvis private storage.')}
+                />
                 <SmallAction
                   label={busyModelId === model.id ? 'Working' : canResume ? 'Resume' : 'Download'}
                   disabled={busyModelId === model.id || (!canDownload && !canResume)}
                   onPress={() => runModelAction(
                     model.id,
                     () => (canResume ? modelManager.resumeDownload(model) : modelManager.install(model)).then(() => undefined),
-                    canResume ? 'Download resumed.' : 'Download started.',
+                    canResume ? 'Download resumed.' : 'Download started. Jarvis selected the exact official file automatically.',
                   )}
                 />
                 <SmallAction
@@ -448,9 +544,26 @@ function RuntimeSettingsScreen({
           onChangeText={setTestPrompt}
           multiline
         />
-        <Pressable style={runtime.primaryButton} onPress={runLocalTest}>
-          <Text style={runtime.primaryButtonText}>Load and Generate Offline</Text>
+        <Pressable style={[runtime.primaryButton, localModelBusy && runtime.disabledButton]} disabled={localModelBusy} onPress={runLocalTest}>
+          <Text style={runtime.primaryButtonText}>{localModelBusy ? `Thinking${thinkingDots}` : 'Run Offline Test'}</Text>
         </Pressable>
+        {localRunPhase !== 'idle' && (
+          <View style={[runtime.thinkingCard, localRunPhase === 'failed' && runtime.thinkingCardError, localRunPhase === 'done' && runtime.thinkingCardDone]}>
+            <View style={runtime.thinkingHeader}>
+              <Text style={runtime.thinkingTitle}>{thinkingTitle(localRunPhase, thinkingDots)}</Text>
+              <Text style={runtime.thinkingPill}>{localRunPhase === 'done' ? 'Ready' : localRunPhase === 'failed' ? 'Failed' : 'Local'}</Text>
+            </View>
+            <Text style={runtime.thinkingDetail}>{thinkingDetail(localRunPhase)}</Text>
+            {localModelBusy && (
+              <View style={runtime.thinkingSteps}>
+                <ThinkingStep label="Prepare runtime" active={localRunPhase === 'preparing'} done={localRunPhase !== 'preparing'} />
+                <ThinkingStep label="Load model" active={localRunPhase === 'loading'} done={localRunPhase === 'thinking' || localRunPhase === 'generating'} />
+                <ThinkingStep label="Think" active={localRunPhase === 'thinking'} done={localRunPhase === 'generating'} />
+                <ThinkingStep label="Generate" active={localRunPhase === 'generating'} done={false} />
+              </View>
+            )}
+          </View>
+        )}
         {!!testResult && <Text style={runtime.message}>{testResult}</Text>}
       </RuntimeSection>
 
@@ -470,8 +583,11 @@ function RuntimeSettingsScreen({
         <RuntimeSection title="Developer Diagnostics">
           <RuntimeRow label="Provider" value={runtimeLabel(diagnostics.provider)} />
           <RuntimeRow label="Current Model" value={diagnostics.currentModel} />
+          <RuntimeRow label="Model Format" value={diagnostics.modelFormat || selectedModel.format} />
+          <RuntimeRow label="Storage Path" value={diagnostics.storagePath || 'Not loaded'} />
           <RuntimeRow label="Context Length" value={`${diagnostics.contextLength}`} />
           <RuntimeRow label="Inference Device" value={diagnostics.inferenceDevice} />
+          <RuntimeRow label="Inference Backend" value={diagnostics.backend} />
           <RuntimeRow label="Accelerator" value={diagnostics.accelerator} />
           <RuntimeRow label="Memory Usage" value={`${diagnostics.memoryUsageGB} GB`} />
           <RuntimeRow label="Peak Memory" value={`${diagnostics.peakMemoryGB} GB`} />
@@ -479,6 +595,9 @@ function RuntimeSettingsScreen({
           <RuntimeRow label="Prompt Tokens" value={`${diagnostics.promptTokens}`} />
           <RuntimeRow label="Generated Tokens" value={`${diagnostics.generatedTokens}`} />
           <RuntimeRow label="Generation Speed" value={`${diagnostics.generationSpeedTokPerSec} tok/s`} />
+          <RuntimeRow label="Load Time" value={`${Math.round(diagnostics.loadTimeMs)}ms`} />
+          <RuntimeRow label="TTFT" value={`${Math.round(diagnostics.timeToFirstTokenMs)}ms`} />
+          <RuntimeRow label="Streaming" value={diagnostics.streamingEnabled ? 'Enabled' : 'Disabled'} />
           <RuntimeRow label="Planner" value={diagnostics.plannerMode} />
           <RuntimeRow label="Temperature" value={`${diagnostics.temperature}`} />
         </RuntimeSection>
@@ -522,6 +641,15 @@ function SmallAction({label, onPress, danger, disabled}: {label: string; onPress
   );
 }
 
+function ThinkingStep({label, active, done}: {label: string; active: boolean; done: boolean}): React.JSX.Element {
+  return (
+    <View style={runtime.thinkingStep}>
+      <View style={[runtime.thinkingDot, active && runtime.thinkingDotActive, done && runtime.thinkingDotDone]} />
+      <Text style={[runtime.thinkingStepText, active && runtime.thinkingStepActiveText, done && runtime.thinkingStepDoneText]}>{label}</Text>
+    </View>
+  );
+}
+
 function ModelDetails({model}: {model: ModelDefinition}): React.JSX.Element {
   return (
     <RuntimeSection title="Model Details">
@@ -530,6 +658,8 @@ function ModelDetails({model}: {model: ModelDefinition}): React.JSX.Element {
       <RuntimeRow label="Parameters" value={model.parameters} />
       <RuntimeRow label="Quantization" value={model.quantization} />
       <RuntimeRow label="Runtime" value={runtimeLabel(model.runtime)} />
+      <RuntimeRow label="Format" value={`.${model.format}`} />
+      <RuntimeRow label="License" value={model.licenseRequired ? 'Needs acceptance on official model page' : 'No gated license flow'} />
       <RuntimeRow label="Download Size" value={`${model.downloadSizeGB} GB`} />
       <RuntimeRow label="Installed Size" value={`${model.installedSizeGB} GB`} />
       <RuntimeRow label="Recommended RAM" value={`${model.recommendedRamGB} GB`} />
@@ -555,6 +685,26 @@ function runtimeLabel(value: string): string {
 
 function statusLabel(status: string): string {
   return status.replace(/_/g, ' ').replace(/^./, char => char.toUpperCase());
+}
+
+function thinkingTitle(phase: string, dots: string): string {
+  if (phase === 'preparing') return `Preparing local runtime${dots}`;
+  if (phase === 'loading') return `Loading model${dots}`;
+  if (phase === 'thinking') return `Thinking${dots}`;
+  if (phase === 'generating') return `Generating response${dots}`;
+  if (phase === 'done') return 'Offline response complete';
+  if (phase === 'failed') return 'Local response failed';
+  return 'Idle';
+}
+
+function thinkingDetail(phase: string): string {
+  if (phase === 'preparing') return 'Jarvis is switching to the on-device MediaPipe runtime.';
+  if (phase === 'loading') return 'The selected model is being loaded into memory.';
+  if (phase === 'thinking') return 'The model has the prompt and is preparing the first token.';
+  if (phase === 'generating') return 'Tokens are streaming from the local model. No cloud provider is used for this test.';
+  if (phase === 'done') return 'The model generated locally and unloaded cleanly.';
+  if (phase === 'failed') return 'Jarvis could not complete the local inference run.';
+  return '';
 }
 
 function formatBytes(bytes: number): string {
@@ -774,12 +924,28 @@ const runtime = StyleSheet.create({
   modelMeta: {fontSize: 12, color: '#716B61', marginTop: 4},
   progressText: {fontSize: 11, color: '#2A4FD4', marginTop: 5, fontVariant: ['tabular-nums']},
   errorText: {fontSize: 11, color: '#8B3A3A', marginTop: 5, lineHeight: 16},
+  helpText: {fontSize: 12, color: '#716B61', lineHeight: 18, marginBottom: 10},
   modelActions: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10},
   smallButton: {borderWidth: 1, borderColor: '#BBB4A7', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7},
   dangerButton: {borderColor: '#A76666'},
   smallButtonText: {fontSize: 11, color: '#24221D', fontWeight: '700'},
   dangerText: {color: '#8B3A3A'},
   message: {marginTop: 10, fontSize: 12, color: '#2A4FD4', lineHeight: 18},
+  thinkingCard: {marginTop: 12, borderRadius: 12, padding: 12, backgroundColor: '#F8F5EF', borderWidth: 1, borderColor: '#D1CABF'},
+  thinkingCardDone: {borderColor: '#7CA887', backgroundColor: '#F1F6F0'},
+  thinkingCardError: {borderColor: '#A76666', backgroundColor: '#F8EEEE'},
+  thinkingHeader: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10},
+  thinkingTitle: {fontSize: 13, color: '#24221D', fontWeight: '700', flex: 1},
+  thinkingPill: {fontSize: 10, color: '#F4F1EA', backgroundColor: '#171713', borderRadius: 999, paddingHorizontal: 8, paddingVertical: 4, overflow: 'hidden', fontWeight: '700'},
+  thinkingDetail: {fontSize: 12, color: '#716B61', marginTop: 6, lineHeight: 17},
+  thinkingSteps: {marginTop: 10, gap: 7},
+  thinkingStep: {flexDirection: 'row', alignItems: 'center', gap: 8},
+  thinkingDot: {width: 8, height: 8, borderRadius: 8, backgroundColor: '#C7BFB2'},
+  thinkingDotActive: {backgroundColor: '#2A4FD4'},
+  thinkingDotDone: {backgroundColor: '#294D3B'},
+  thinkingStepText: {fontSize: 11, color: '#746E62'},
+  thinkingStepActiveText: {color: '#2A4FD4', fontWeight: '700'},
+  thinkingStepDoneText: {color: '#294D3B'},
 });
 
 const dev = StyleSheet.create({

@@ -70,6 +70,10 @@ export interface NativeInstalledModel {
   installedSizeBytes: number;
   downloadedBytes: number;
   totalBytes: number;
+  format?: string;
+  storagePath?: string;
+  benchmarkJson?: string;
+  importedFileName?: string;
   error?: string;
 }
 
@@ -91,6 +95,11 @@ export interface NativeRuntimeDiagnostics {
   cpuUsage?: string;
   timeToFirstTokenMs?: number;
   loadTimeMs?: number;
+  initializationTimeMs?: number;
+  backend?: string;
+  modelFormat?: string;
+  storagePath?: string;
+  streamingEnabled?: boolean;
 }
 
 interface LocalAiRuntimeModule {
@@ -101,6 +110,11 @@ interface LocalAiRuntimeModule {
   getModelState(modelId: string): Promise<NativeInstalledModel>;
   getStorageUsageBytes(): Promise<number>;
   downloadModel(model: Record<string, unknown>): Promise<boolean>;
+  getHuggingFaceTokenConfigured(): Promise<boolean>;
+  setHuggingFaceToken(token: string): Promise<boolean>;
+  clearHuggingFaceToken(): Promise<boolean>;
+  openModelPage(url: string): Promise<boolean>;
+  importModelFromPicker(model: Record<string, unknown>): Promise<NativeInstalledModel>;
   pauseDownload(modelId: string): Promise<boolean>;
   resumeDownload(model: Record<string, unknown>): Promise<boolean>;
   cancelDownload(modelId: string): Promise<boolean>;

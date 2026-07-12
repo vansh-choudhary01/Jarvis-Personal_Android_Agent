@@ -15,12 +15,19 @@ export type RuntimeProvider =
 export type CapabilityScore = 'Low' | 'Medium' | 'High' | 'Ultra';
 export type ModelInstallStatus =
   | 'not_installed'
+  | 'needs_license_acceptance'
   | 'downloading'
   | 'paused'
   | 'installing'
+  | 'benchmarking'
   | 'ready'
   | 'loading'
   | 'loaded'
+  | 'running'
+  | 'corrupted'
+  | 'unsupported'
+  | 'missing'
+  | 'invalid_model'
   | 'failed';
 
 export interface RuntimeDetection {
@@ -38,7 +45,10 @@ export interface ModelDefinition {
   parameters: string;
   quantization: string;
   runtime: RuntimeProvider;
+  format: 'task' | 'litertlm';
   downloadUrl: string;
+  modelPageUrl: string;
+  licenseRequired: boolean;
   fileName: string;
   checksumSha256: string;
   downloadSizeGB: number;
@@ -73,7 +83,23 @@ export interface InstalledModel {
   installedSizeGB: number;
   downloadedBytes: number;
   totalBytes: number;
+  format?: string;
+  storagePath?: string;
+  importedFileName?: string;
+  benchmark?: ModelBenchmark;
   error?: string;
+}
+
+export interface ModelBenchmark {
+  loadTimeMs: number;
+  timeToFirstTokenMs: number;
+  tokensPerSecond: number;
+  peakRamBytes: number;
+  currentRamBytes: number;
+  backend: string;
+  initializationTimeMs: number;
+  generatedTokens: number;
+  validatedAt: string;
 }
 
 export interface RuntimeSettings {
@@ -105,6 +131,11 @@ export interface RuntimeDiagnostics {
   cpuUsage: string;
   timeToFirstTokenMs: number;
   loadTimeMs: number;
+  initializationTimeMs: number;
+  backend: string;
+  modelFormat: string;
+  storagePath: string;
+  streamingEnabled: boolean;
 }
 
 export interface GenerationRequest {
@@ -219,17 +250,17 @@ export function recommendModel(
   if (settings.modelId !== 'auto') {
     model = MODEL_REGISTRY.find(item => item.id === settings.modelId) ?? fallback;
   } else if (ram < 5) {
-    model = settings.preferHigherAccuracy
-      ? pickById('deepseek-r1-distill-qwen-1.5b-mediapipe-q4')
-      : pickById('gemma-3-1b-mediapipe-q4');
-  } else if (ram < 10) {
+    model = pickById('gemma-3-1b-it-mediapipe-task');
+  } else if (ram < 8) {
+    model = pickById('gemma-3-1b-it-mediapipe-task');
+  } else if (ram < 12) {
     model = settings.preferHigherAccuracy && !settings.preferFasterModels
-      ? pickById('deepseek-r1-distill-qwen-7b-mediapipe-q4')
-      : pickById('qwen3-4b-mediapipe-q4');
+      ? pickById('gemma-3n-e2b-it-litertlm')
+      : pickById('gemma-3-1b-it-mediapipe-task');
   } else {
     model = settings.preferHigherAccuracy
-      ? pickById('deepseek-r1-distill-qwen-7b-mediapipe-q4')
-      : pickById('qwen3-8b-mediapipe-q4');
+      ? pickById('gemma-3n-e4b-it-litertlm')
+      : pickById('gemma-3n-e2b-it-litertlm');
   }
 
   const runtime = settings.runtime === 'auto' ? 'mediapipe' : settings.runtime;
@@ -237,10 +268,32 @@ export function recommendModel(
     model,
     runtime,
     score,
-    reason: `Selected for ${Math.round(ram)} GB RAM, ${profile.cpuCores} CPU cores, ${score.toLowerCase()} capability, and ${settings.preferFasterModels ? 'faster response preference' : 'quality preference'}.`,
+    reason: `Selected from official MediaPipe/LiteRT-compatible models for ${Math.round(ram)} GB RAM, ${profile.cpuCores} CPU cores, ${score.toLowerCase()} capability, model size, and ${settings.preferFasterModels ? 'faster response preference' : 'quality preference'}. Jarvis will refine this after the first benchmark.`,
     estimatedMemoryGB: Math.round(model.installedSizeGB * 0.78 * 10) / 10,
     estimatedPerformance: score === 'Low' ? 'Usable for short responses' : score === 'Medium' ? 'Balanced offline chat' : 'Good offline automation latency',
     estimatedStorageGB: model.installedSizeGB,
+  };
+}
+
+export function refineRecommendationWithBenchmarks(
+  recommendation: ModelRecommendation,
+  installed: InstalledModel[],
+): ModelRecommendation {
+  const benchmarked = installed.find(item => item.modelId === recommendation.model.id && item.benchmark);
+  if (!benchmarked?.benchmark || benchmarked.benchmark.tokensPerSecond >= 4) return recommendation;
+
+  const smaller = MODEL_REGISTRY
+    .filter(model => model.runtime === 'mediapipe' && model.installedSizeGB < recommendation.model.installedSizeGB)
+    .sort((a, b) => b.installedSizeGB - a.installedSizeGB)[0];
+  if (!smaller) return recommendation;
+
+  return {
+    ...recommendation,
+    model: smaller,
+    reason: `${recommendation.reason} Previous benchmark was slow (${benchmarked.benchmark.tokensPerSecond.toFixed(1)} tok/s), so Jarvis suggests the smaller ${smaller.displayName}.`,
+    estimatedStorageGB: smaller.installedSizeGB,
+    estimatedMemoryGB: Math.round(smaller.installedSizeGB * 0.78 * 10) / 10,
+    estimatedPerformance: 'Adjusted after benchmark: prefer smaller model for usable latency',
   };
 }
 
@@ -252,6 +305,14 @@ function modelPayload(model: ModelDefinition) {
 }
 
 function nativeStateToInstalled(value: any): InstalledModel {
+  let benchmark: ModelBenchmark | undefined;
+  if (value.benchmarkJson) {
+    try {
+      benchmark = JSON.parse(String(value.benchmarkJson)) as ModelBenchmark;
+    } catch {
+      benchmark = undefined;
+    }
+  }
   return {
     modelId: String(value.modelId),
     status: String(value.status ?? 'not_installed') as ModelInstallStatus,
@@ -260,6 +321,10 @@ function nativeStateToInstalled(value: any): InstalledModel {
     installedSizeGB: Number(value.installedSizeBytes ?? 0) / 1024 / 1024 / 1024,
     downloadedBytes: Number(value.downloadedBytes ?? 0),
     totalBytes: Number(value.totalBytes ?? 0),
+    format: value.format ? String(value.format) : undefined,
+    storagePath: value.storagePath ? String(value.storagePath) : undefined,
+    importedFileName: value.importedFileName ? String(value.importedFileName) : undefined,
+    benchmark,
     error: value.error ? String(value.error) : undefined,
   };
 }
@@ -281,6 +346,27 @@ class NativeModelManager {
   async install(model: ModelDefinition): Promise<InstalledModel> {
     await JarvisLocalAiRuntime.downloadModel(modelPayload(model));
     return this.getModelState(model.id);
+  }
+
+  async isHuggingFaceTokenConfigured(): Promise<boolean> {
+    return JarvisLocalAiRuntime.getHuggingFaceTokenConfigured();
+  }
+
+  async setHuggingFaceToken(token: string): Promise<void> {
+    await JarvisLocalAiRuntime.setHuggingFaceToken(token);
+  }
+
+  async clearHuggingFaceToken(): Promise<void> {
+    await JarvisLocalAiRuntime.clearHuggingFaceToken();
+  }
+
+  async openModelPage(model: ModelDefinition): Promise<void> {
+    if (!model.modelPageUrl) throw new Error('No official model page is configured.');
+    await JarvisLocalAiRuntime.openModelPage(model.modelPageUrl);
+  }
+
+  async importFromPicker(model: ModelDefinition): Promise<InstalledModel> {
+    return nativeStateToInstalled(await JarvisLocalAiRuntime.importModelFromPicker(modelPayload(model)));
   }
 
   async pauseDownload(modelId: string): Promise<InstalledModel> {
@@ -452,6 +538,11 @@ export function diagnosticsFromNative(
     cpuUsage: native.cpuUsage || 'Unavailable',
     timeToFirstTokenMs: native.timeToFirstTokenMs ?? 0,
     loadTimeMs: native.loadTimeMs ?? 0,
+    initializationTimeMs: native.initializationTimeMs ?? native.loadTimeMs ?? 0,
+    backend: native.backend || native.inferenceDevice || 'Auto',
+    modelFormat: native.modelFormat || recommendation.model.format,
+    storagePath: native.storagePath || '',
+    streamingEnabled: native.streamingEnabled ?? recommendation.model.supportsStreaming,
   };
 }
 
