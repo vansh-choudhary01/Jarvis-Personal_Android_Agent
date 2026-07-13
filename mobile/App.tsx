@@ -13,7 +13,6 @@ import {
   View,
 } from 'react-native';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
-import {isJarvisConfigured, JARVIS_CONFIG} from './src/config';
 import {JarvisController, type LogEntry} from './src/JarvisController';
 import {JarvisAccessibility, JarvisDevice, type DeviceProfile, type PermissionStatus} from './src/native';
 import {
@@ -97,10 +96,7 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
     };
   }, [refresh]);
 
-  const ready = useMemo(
-    () => Object.values(permissions).every(Boolean) && isJarvisConfigured,
-    [permissions],
-  );
+  const ready = useMemo(() => Object.values(permissions).every(Boolean), [permissions]);
 
   useEffect(() => {
     if (!ready || started.current) return;
@@ -147,15 +143,6 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
             <Text style={[styles.tabText, screen === 'runtime' && styles.tabTextActive]}>AI Runtime</Text>
           </Pressable>
         </View>
-
-        {screen === 'setup' && !isJarvisConfigured && (
-          <View style={styles.configCard}>
-            <Text style={styles.configTitle}>Configure the brain first</Text>
-            <Text style={styles.configText}>
-              Edit src/config.ts and replace the WebSocket URL and phone token. Current URL: {JARVIS_CONFIG.brainWebSocketUrl}
-            </Text>
-          </View>
-        )}
 
         {screen === 'setup' ? (
           <>
@@ -734,18 +721,10 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
 
   const submitTask = async () => {
     if (!instruction.trim()) return;
-    setSubmitResult('Sending…');
+    setSubmitResult('Starting local task…');
     try {
-      const res = await fetch(`${JARVIS_CONFIG.brainWebSocketUrl.replace(/^ws/, 'http').replace('/phone', '')}/task`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${JARVIS_CONFIG.phoneAuthToken}`,
-        },
-        body: JSON.stringify({instruction: instruction.trim()}),
-      });
-      const json = await res.json() as {taskId?: string; status?: string; error?: string};
-      setSubmitResult(json.error ?? `Accepted — ${json.taskId}`);
+      const taskId = await JarvisController.submitTask(instruction.trim());
+      setSubmitResult(`Accepted — ${taskId}`);
     } catch (e) {
       setSubmitResult(`Failed: ${String(e)}`);
     }
@@ -760,7 +739,7 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
       {/* Connection */}
       <DevSection title="Connection">
         <DevRow label="Status" value={connection} />
-        <DevRow label="URL" value={JARVIS_CONFIG.brainWebSocketUrl} />
+        <DevRow label="Brain" value="Embedded TypeScript runtime via BrainRuntime" />
       </DevSection>
 
       {/* Permissions */}

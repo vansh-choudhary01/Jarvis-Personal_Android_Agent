@@ -55,6 +55,7 @@ interface DeviceModule {
   startForegroundService(brainUrl: string, authToken: string): Promise<boolean>;
   stopForegroundService(): Promise<boolean>;
   openApp(packageName: string): Promise<boolean>;
+  listApps(): Promise<Array<{label: string; packageName: string}>>;
   openAccessibilitySettings(): void;
   openNotificationSettings(): void;
   openBatterySettings(): void;

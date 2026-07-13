@@ -50,6 +50,23 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
     promise.resolve(true)
   }
 
+  @ReactMethod fun listApps(promise: Promise) {
+    runCatching {
+      val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+      val apps = context.packageManager
+        .queryIntentActivities(launcherIntent, 0)
+        .sortedBy { it.loadLabel(context.packageManager).toString().lowercase() }
+      promise.resolve(Arguments.createArray().apply {
+        apps.forEach { app ->
+          pushMap(Arguments.createMap().apply {
+            putString("label", app.loadLabel(context.packageManager).toString())
+            putString("packageName", app.activityInfo.packageName)
+          })
+        }
+      })
+    }.onFailure { promise.reject("LIST_APPS_FAILED", it) }
+  }
+
   @ReactMethod fun openAccessibilitySettings() = openSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS)
   @ReactMethod fun openNotificationSettings() = openSettings("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
   @ReactMethod fun openBatterySettings() = openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)

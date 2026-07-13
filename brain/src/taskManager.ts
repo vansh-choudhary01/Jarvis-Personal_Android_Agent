@@ -1,7 +1,7 @@
-import type WebSocket from 'ws';
 import {AndroidAgent, type HistoryStep} from './agent.js';
 import {logEvent} from './logger.js';
 import type {AgentAction, BrainMessage, ScreenState} from './protocol.js';
+import type {PhoneTransport} from './phoneTransport.js';
 
 interface ActiveTask {
   id: string;
@@ -13,24 +13,24 @@ interface ActiveTask {
 }
 
 export class TaskManager {
-  private phone: WebSocket | null = null;
+  private phone: PhoneTransport | null = null;
   private task: ActiveTask | null = null;
   private recentPhoneEvents: Record<string, unknown>[] = [];
 
   constructor(private readonly agent: AndroidAgent) {}
 
-  attachPhone(phone: WebSocket): void {
+  attachPhone(phone: PhoneTransport): void {
     if (this.phone && this.phone !== phone) {
-      this.phone.close(4001, 'Replaced by a new phone connection');
+      this.phone.close?.(4001, 'Replaced by a new phone connection');
     }
     this.phone = phone;
-    phone.on('close', () => {
+    phone.onClose(() => {
       if (this.phone === phone) this.phone = null;
     });
   }
 
   hasPhone(): boolean {
-    return this.phone !== null && this.phone.readyState === this.phone.OPEN;
+    return this.phone !== null && this.phone.isConnected();
   }
 
   getTask(): Readonly<ActiveTask> | null {
@@ -41,7 +41,7 @@ export class TaskManager {
     if (!this.hasPhone()) throw new Error('Phone is not connected');
     if (this.task) throw new Error('A task is already active');
 
-    const id = crypto.randomUUID();
+    const id = createTaskId();
     this.task = {
       id,
       instruction,
@@ -136,9 +136,35 @@ export class TaskManager {
   }
 
   private send(message: BrainMessage): void {
-    if (!this.phone || this.phone.readyState !== this.phone.OPEN) {
+    if (!this.phone || !this.phone.isConnected()) {
       throw new Error('Phone disconnected');
     }
-    this.phone.send(JSON.stringify(message));
+    this.phone.send(message);
   }
+}
+
+let taskIdCounter = 0;
+
+function createTaskId(): string {
+  const runtimeCrypto = (globalThis as {
+    crypto?: {
+      randomUUID?: () => string;
+      getRandomValues?: (array: Uint8Array) => Uint8Array;
+    };
+  }).crypto;
+
+  if (runtimeCrypto?.randomUUID) {
+    return runtimeCrypto.randomUUID();
+  }
+
+  if (runtimeCrypto?.getRandomValues) {
+    const bytes = runtimeCrypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0'));
+    return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
+  }
+
+  taskIdCounter = (taskIdCounter + 1) % Number.MAX_SAFE_INTEGER;
+  return `task-${Date.now().toString(36)}-${taskIdCounter.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }

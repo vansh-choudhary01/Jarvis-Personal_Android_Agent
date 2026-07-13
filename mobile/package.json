@@ -3,7 +3,9 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
+    "preandroid": "cd ../brain && npm run build",
     "android": "react-native run-android",
+    "prestart": "cd ../brain && npm run build",
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
@@ -13,7 +15,8 @@
     "@react-native/new-app-screen": "0.86.0",
     "react": "19.2.3",
     "react-native": "0.86.0",
-    "react-native-safe-area-context": "^5.5.2"
+    "react-native-safe-area-context": "^5.5.2",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

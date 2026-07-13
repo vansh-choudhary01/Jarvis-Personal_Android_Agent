@@ -1,56 +1,237 @@
-# Jarvis v1
+# Jarvis
 
-Jarvis is a personal, sideload-only Android agent for a device you own. A Node.js brain asks an AI model for one validated action at a time; a native Android foreground service executes the action and returns a fresh Accessibility tree.
+Jarvis is a sideload-only Android personal AI agent for a phone you own. The current app runs the TypeScript Brain inside the Android debug app through the React Native JavaScript runtime, while Kotlin provides Android capabilities such as Accessibility, notifications, calls, SMS, foreground service, overlays, files, and MediaPipe local inference.
 
-## What v1 can do
+The laptop Node server is no longer required for normal Android use. It remains as a development adapter for testing the same Brain runtime from a PC.
 
-- Open installed apps, tap visible text or coordinates, type, swipe, and wait.
-- Discover installed apps with `list_apps` before opening them by package name.
-- Continue multi-step tasks while another app is in the foreground.
-- Read the recent Android call log and distinguish incoming, outgoing, and missed calls.
-- Use captured WhatsApp/WhatsApp Business notifications for recent-message questions.
-- Relay notifications and incoming SMS as passive events.
-- Start a phone call when the instruction explicitly requests it.
-- Read browser history by navigating Chrome's UI (three-dot menu → History).
-- Show a floating overlay bubble with live task instruction, status, and progress bar.
-- Stop safely after three identical actions or 20 total actions.
-- Append a full audit trail (LLM requests, responses, actions, results) to `brain/logs/actions.jsonl`.
-
-Jarvis cannot unlock the phone, enter a PIN, approve biometrics, read `FLAG_SECURE` screens, or reliably control apps that expose no Accessibility nodes.
-
-## Architecture
+## Current architecture
 
 ```text
-PowerShell / API client
-        |
-        | POST /task
-        v
-Node + TypeScript brain (port 3000)
-        |
-        | Anthropic or Google Gemini API
-        | WebSocket /phone?token=...
-        v
-Native Android foreground service
-        |
-        +-- Accessibility service: screen tree and gestures
-        +-- Notification listener: WhatsApp and other notifications
-        +-- Call log / SMS / telephony integrations
-        +-- Floating overlay: live task status and progress
+Jarvis APK
+├─ React Native UI
+│  └─ setup, runtime screen, logs, developer controls
+├─ Embedded TypeScript Brain
+│  ├─ Planner
+│  ├─ Agent loop
+│  ├─ Task Manager
+│  └─ Protocol
+└─ Kotlin native bridge
+   ├─ Foreground service
+   ├─ Accessibility actions and screen tree
+   ├─ Notifications, calls, SMS
+   ├─ Floating overlay
+   └─ Google AI Edge / MediaPipe local model runtime
 ```
 
-The WebSocket and action loop run natively in `JarvisForegroundService.kt`. They do not depend on the React Native screen remaining visible. Metro is only the JavaScript development server for debug builds.
+Important boundary: Planner, Agents, Task Manager, Protocol, and future Memory stay in TypeScript. Kotlin stays a thin platform layer. The Brain calls one runtime interface; it does not know whether the model is MediaPipe, cloud, or a future runtime.
+
+## What works now
+
+- Run the Brain locally inside the Android app.
+- Start the native foreground service in local mode with `local://embedded-brain`.
+- Observe screen state and device events from the native layer.
+- Execute Android actions through Accessibility: tap, type, swipe, find-and-tap, open apps, wait.
+- List installed launchable apps.
+- Read recent call log entries.
+- Relay notifications and incoming SMS as passive events.
+- Show a floating Jarvis overlay with task/status/progress.
+- Manage local AI models from the AI Runtime screen.
+- Import `.task` / `.litertlm` models through Android's document picker.
+- Load and test local models through the MediaPipe runtime bridge.
+- Run an offline local-model test from the app.
+
+Jarvis cannot unlock the phone, enter a PIN, approve biometrics, read `FLAG_SECURE` screens, or reliably control apps that expose no useful Accessibility nodes.
 
 ## Requirements
 
-- Windows, macOS, or Linux for the brain
+- Windows PowerShell
 - Node.js 22+
-- An Anthropic API key or a Google Gemini API key
 - Java 21
-- Android Studio and Android SDK Platform 36
-- Android Build Tools 36.0.0, Platform Tools, CMake 3.22.1, and NDK `27.1.12297006`
-- Android 8/API 26 or newer; a physical phone is recommended
+- Android Studio
+- Android SDK Platform 36
+- Android Build Tools 36.0.0
+- Android SDK Platform Tools
+- CMake 3.22.1
+- NDK `27.1.12297006`
+- Android 8/API 26 or newer
+- A physical phone is recommended
 
-## 1. Configure and run the brain
+## Important Windows rule: split Metro and Gradle paths
+
+React Native's native CMake build can fail on Windows when the repo path is too long:
+
+```text
+Filename longer than 260 characters
+```
+
+But Metro can fail on Windows `subst` drives because its file hashing can resolve the real path internally while the project root says `X:\...`. The reliable setup is:
+
+- Start Metro from the real `C:\...` path.
+- Run Android/Gradle build commands from the short `X:\...` path.
+- Do not start Metro from `X:\...`.
+- Do not run Gradle from the deep `C:\...` path.
+
+Create the short drive once per terminal session:
+
+```powershell
+subst X: /D 2>$null
+subst X: "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis"
+```
+
+This split is intentional: Metro gets the real path it expects, while Gradle/CMake gets the short path it needs.
+
+## First-time install
+
+Install dependencies from the real repo path:
+
+```powershell
+cd "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis\mobile"
+npm.cmd install
+```
+
+The mobile package scripts automatically build the TypeScript Brain before starting Metro or Android. The Brain build emits both ESM and CommonJS output:
+
+```json
+"prestart": "cd ../brain && npm run build",
+"preandroid": "cd ../brain && npm run build"
+```
+
+Mobile imports the CommonJS Brain output from `brain/dist-cjs` so Metro can bundle it cleanly.
+
+## Run on a connected phone
+
+1. Check and free the usual dev ports if needed:
+
+```powershell
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { 3000,8081,8082,8083,19000,19001,5037 -contains $_.LocalPort } |
+  Select-Object LocalPort, OwningProcess
+```
+
+2. Start Metro on `8081` from the real path, not from `X:\...`:
+
+```powershell
+cd "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis\mobile"
+npm.cmd start -- --reset-cache --port 8081
+```
+
+3. In a second terminal, build and install from the short path using the already-running Metro server:
+
+```powershell
+subst X: /D 2>$null
+subst X: "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis"
+cd X:\mobile
+$env:Path = "$env:LOCALAPPDATA\Android\Sdk\platform-tools;$env:Path"
+npm.cmd run android -- --device ZD222TQVPK --port 8081 --no-packager
+```
+
+Replace `ZD222TQVPK` with your device id from:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" devices
+```
+
+Why `--no-packager`: Metro is already running on `8081`. Without this flag, React Native may ask to switch to `8082`, which can recreate confusing dev-server behavior.
+
+Why Metro uses `C:\...`: this avoids the Windows `subst` drive SHA-1/file-hasher issue.
+
+Why Android uses `X:\...`: this avoids the CMake/Ninja 260-character path limit.
+
+## Metro and Brain bundling notes
+
+`mobile/metro.config.js` intentionally watches `../brain` but resolves `zod` from `mobile/node_modules`:
+
+```js
+extraNodeModules: {
+  zod: path.join(mobile, 'node_modules', 'zod'),
+}
+```
+
+This prevents Metro from loading `brain/node_modules/zod` v4 ESM syntax while bundling `brain/dist-cjs/protocol.js`. Mobile uses `zod` v3 CommonJS for the embedded Brain bundle.
+
+## If the Android build gets stuck or CMake looks corrupted
+
+Do not patch Gradle, `settings.gradle`, React Native internals, or autolinking first. Clean generated artifacts and rebuild from `X:\mobile`:
+
+```powershell
+cd X:\mobile\android
+.\gradlew.bat --stop
+
+Remove-Item -LiteralPath .\build -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath .\app\build -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath .\app\.cxx -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath .\.gradle -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+If Windows refuses to delete long generated paths, use the long-path prefix from PowerShell:
+
+```powershell
+[System.IO.Directory]::Delete("\\?\X:\mobile\android\app\build", $true)
+[System.IO.Directory]::Delete("\\?\X:\mobile\android\app\.cxx", $true)
+```
+
+Then start Metro from the real `C:\...` path and run Android again from `X:\mobile`.
+
+## Phone permissions
+
+Open Jarvis and complete each setup row:
+
+1. Accessibility control
+2. Notification access
+3. Call, SMS, and notification runtime permissions
+4. Unrestricted/not-optimized battery usage
+
+The app starts the embedded Brain automatically when every permission is ready. Android shows an ongoing Jarvis foreground-service notification.
+
+## Sending tasks
+
+The current development UI has a hidden Developer screen:
+
+1. Open Jarvis.
+2. Tap the `Jarvis` title three times.
+3. Use the Developer task input.
+
+Example tasks:
+
+```text
+Open Settings and tell me the Android version.
+Tell me who recently called me.
+Tell me who recently messaged me on WhatsApp or called me.
+Open Calculator and calculate 125 multiplied by 8.
+```
+
+WhatsApp history is notification-based. Jarvis can report notifications captured while its notification listener was active; it does not read WhatsApp's private database.
+
+## Local AI Runtime
+
+Open the `AI Runtime` tab in the app to:
+
+- View device information.
+- See the recommended local model.
+- Import a `.task` or `.litertlm` model.
+- Download supported models when a direct URL is available.
+- Open a license page when a model is gated.
+- Mark a model active.
+- Delete installed models.
+- View storage usage.
+- Run an offline test.
+- See diagnostics in Developer Mode.
+
+Model files are stored in Jarvis private app storage. Deleting a model from Jarvis should reclaim that storage.
+
+Supported runtime direction:
+
+```text
+ModelRuntime
+└─ MediaPipeRuntime
+   └─ Google AI Edge / MediaPipe LLM native bridge
+```
+
+Do not use GGUF, Ollama models, or Hugging Face safetensors for this runtime. Jarvis expects MediaPipe/LiteRT-compatible `.task` or `.litertlm` files.
+
+## Optional laptop Brain server
+
+The Node server is still available for development/testing:
 
 ```powershell
 cd brain
@@ -60,164 +241,42 @@ npm.cmd run build
 npm.cmd start
 ```
 
-Set these values in `brain/.env`:
+Useful endpoints in that dev adapter:
 
-```env
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=your-anthropic-key
-ANTHROPIC_MODEL=claude-sonnet-4-6
-GEMINI_API_KEY=your-gemini-key
-GEMINI_MODEL=gemini-2.5-flash
-PHONE_AUTH_TOKEN=generate-a-long-random-secret
-PORT=3000
-```
+- `GET /health`
+- `POST /task`
+- `GET /phone`
 
-Choose the active model provider with `AI_PROVIDER`:
+Normal Android operation should use the embedded Brain through `mobile/src/JarvisController.ts`, not the laptop server.
 
-```env
-# Claude
-AI_PROVIDER=anthropic
+## Implementation map
 
-# Gemini
-AI_PROVIDER=gemini
-```
-
-Only the API key for the selected provider is required. Provider keys stay in the server-side `.env` and are never placed in the Android app. `/health` reports the active `provider` and `model`.
-
-Never commit `.env`. The brain exposes:
-
-- `GET /health` — connection and active-task status
-- `POST /task` — submit one instruction
-- `GET /phone` — authenticated WebSocket upgrade used by Android
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:3000/health
-```
-
-## 2. Configure the Android app
-
-Edit `mobile/src/config.ts`. The token must exactly match `PHONE_AUTH_TOKEN`.
-
-For a physical phone connected over USB:
-
-```ts
-export const JARVIS_CONFIG = {
-  brainWebSocketUrl: 'ws://127.0.0.1:3000/phone',
-  phoneAuthToken: 'the-same-long-token-as-the-brain',
-};
-```
-
-For an emulator, use `ws://10.0.2.2:3000/phone`. For use without USB, deploy the brain behind TLS and use a reachable `wss://` URL.
-
-## 3. Build and install Android
-
-Install JS dependencies and start Metro (required for debug builds):
-
-```powershell
-cd mobile
-npm.cmd install
-npm.cmd start
-```
-
-In another terminal, build and install the APK. Long Windows paths break React Native's C++ build, so map the project to a short drive first:
-
-```powershell
-subst J: "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis"
-cd J:\mobile\android
-.\gradlew.bat assembleDebug -PreactNativeArchitectures=arm64-v8a
-& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r app\build\outputs\apk\debug\app-debug.apk
-```
-
-Or use `installDebug` if the device is already connected and ADB forwarding is active:
-
-```powershell
-.\gradlew.bat installDebug
-```
-
-> ADB port forwarding must be set each session (after every USB reconnect or reboot):
-> ```powershell
-> & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8081 tcp:8081
-> & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:3000 tcp:3000
-> ```
-
-## 4. Grant one-time phone permissions
-
-Open Jarvis and complete all four rows:
-
-1. Accessibility control
-2. Notification access
-3. Call, SMS, and notification runtime permissions
-4. Unrestricted/not-optimized battery usage
-
-The app connects automatically when every row is ready. Android displays an ongoing **Jarvis is running** notification.
-
-## 5. Submit instructions
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:3000/task" `
-  -Headers @{
-    Authorization = "Bearer $((Get-Content brain\.env | Select-String 'PHONE_AUTH_TOKEN=(.+)').Matches[0].Groups[1].Value)"
-    "Content-Type" = "application/json"
-  } `
-  -Body (@{
-    instruction = "Open Settings and tell me the Android version"
-  } | ConvertTo-Json)
-```
-
-Or set the token explicitly (must match `PHONE_AUTH_TOKEN` in `brain/.env`):
-
-```powershell
-$token = "your-token-here"
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:3000/task" `
-  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
-  -Body (@{ instruction = "Open Settings and tell me the Android version" } | ConvertTo-Json)
-```
-
-The response `status: accepted` means the task started, not that it finished. Watch the Jarvis connection card or `brain/logs/actions.jsonl` for `task_finished`.
-
-Example instructions:
-
-```text
-Open Calculator and calculate 125 multiplied by 8.
-Tell me who recently called me. Use the recent call log.
-Tell me who recently messaged me on WhatsApp or called me. Use notification history and the recent call log; do not open WhatsApp unless necessary.
-Show me my recent Chrome browser history.
-```
-
-WhatsApp history is notification-based: Jarvis can report notifications captured while its notification listener was active. It does not read WhatsApp's private database.
-
-Browser history is read via UI automation: Jarvis opens Chrome, taps the three-dot menu, taps History, and reads the visible entries from the Accessibility tree.
+- `brain/src/runtime.ts` — portable `BrainRuntime` boundary.
+- `brain/src/agent.ts` — planner/agent action loop using the LLM runtime abstraction.
+- `brain/src/taskManager.ts` — task lifecycle and phone transport integration.
+- `brain/src/protocol.ts` — Zod schemas for phone messages and actions.
+- `brain/src/llmRuntime.ts` — cloud LLM adapter for the optional Node server.
+- `brain/src/phoneTransport.ts` — reusable phone transport interface.
+- `brain/src/logger.ts` — portable log sink.
+- `brain/src/nodeLogger.ts` — Node-only file logger for dev server logs.
+- `brain/src/index.ts` — optional laptop HTTP/WebSocket adapter.
+- `brain/tsconfig.cjs.json` — CommonJS Brain build used by Metro.
+- `mobile/src/JarvisController.ts` — current embedded Brain host in React Native.
+- `mobile/src/localAiRuntime.ts` — model registry, recommendation, model manager, MediaPipe runtime adapter.
+- `mobile/src/modelRegistry.json` — data-driven local model registry.
+- `mobile/src/native.ts` — React Native native-module types.
+- `mobile/android/app/src/main/java/com/yourname/jarvis/JarvisForegroundService.kt` — local-mode foreground service and native event bridge.
+- `mobile/android/app/src/main/java/com/yourname/jarvis/DeviceModule.kt` — Android permissions, app list, model/file/device bridge helpers.
+- `mobile/android/app/src/main/java/com/yourname/jarvis/JarvisAccessibilityService.kt` — screen tree and gestures.
+- `mobile/android/app/src/main/java/com/yourname/jarvis/JarvisOverlayController.kt` — floating task overlay.
+- `mobile/App.tsx` — setup UI, AI Runtime UI, developer controls.
 
 ## Privacy and safety
 
-Jarvis sends task text, recent action history, relevant passive phone events, and the current Accessibility tree to whichever AI provider you select: Anthropic or Google Gemini. This data can contain private screen text, contact names, phone numbers, and notification content. Screenshots are sent only if the phone supplies one.
+Jarvis observes screen text through Accessibility, notifications, SMS events, and call-log data on a phone you control. Local-model inference stays on device. If you use the optional Node/cloud adapter, task context may be sent to the selected provider.
 
 - Use only on a phone you own and control.
-- Protect the API key, phone token, TLS keys, logs, and server.
-- Do not expose the plaintext brain directly to the internet.
+- Protect model files, logs, tokens, and API keys.
+- Do not expose the optional development server directly to the internet.
 - Review instructions that could call, message, purchase, delete, or disclose data.
 - This permission set is not intended for Play Store distribution.
-
-## Deployment
-
-The included `brain/deploy/jarvis-brain.service` expects the built brain at `/opt/jarvis/brain` and environment values in `/opt/jarvis/brain/.env`. Put Nginx, Caddy, or an AWS load balancer in front of it for TLS, then configure the phone with the resulting `wss://` endpoint.
-
-## v1 implementation map
-
-- `brain/src/index.ts` — HTTP and WebSocket server
-- `brain/src/taskManager.ts` — task lifecycle, installed-app cache, passive-event context, and loop guards
-- `brain/src/agent.ts` — system prompt, Anthropic/Gemini one-action decision loop, LLM request/response logging
-- `brain/src/protocol.ts` — Zod schemas for all phone messages and agent actions (including `list_apps`, `status`, `progress`)
-- `brain/src/logger.ts` — append-only JSONL audit log at `brain/logs/actions.jsonl`
-- `mobile/android/.../JarvisForegroundService.kt` — native WebSocket, reconnect, action execution (`list_apps`, `open_app` with Chrome fallback, gestures, calls)
-- `mobile/android/.../JarvisAccessibilityService.kt` — node-tree capture and gestures; owns the overlay
-- `mobile/android/.../JarvisOverlayController.kt` — floating J bubble, draggable panel, task/status/progress display
-- `mobile/android/.../JarvisNotificationListenerService.kt` — notification forwarding
-- `mobile/android/.../TelephonyModule.kt` — call, SMS, and call-log bridge
-- `mobile/App.tsx` — permission onboarding and connection status

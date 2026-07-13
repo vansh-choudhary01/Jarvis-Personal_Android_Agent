@@ -42,6 +42,7 @@ class JarvisForegroundService : Service() {
   private var authToken = ""
   private var reconnect: Runnable? = null
   private var stopped = false
+  private var localMode = false
   private var currentStatus = "Not started"
 
   override fun onCreate() {
@@ -59,7 +60,8 @@ class JarvisForegroundService : Service() {
     val prefs = getSharedPreferences("jarvis", MODE_PRIVATE)
     brainUrl = intent?.getStringExtra(EXTRA_BRAIN_URL) ?: prefs.getString(EXTRA_BRAIN_URL, "").orEmpty()
     authToken = intent?.getStringExtra(EXTRA_AUTH_TOKEN) ?: prefs.getString(EXTRA_AUTH_TOKEN, "").orEmpty()
-    if (brainUrl.isNotBlank() && authToken.isNotBlank()) {
+    localMode = brainUrl.startsWith("local://")
+    if (!localMode && brainUrl.isNotBlank() && authToken.isNotBlank()) {
       prefs.edit().putString(EXTRA_BRAIN_URL, brainUrl).putString(EXTRA_AUTH_TOKEN, authToken).apply()
     }
 
@@ -72,20 +74,28 @@ class JarvisForegroundService : Service() {
       NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(R.mipmap.ic_launcher)
         .setContentTitle("Jarvis is running")
-        .setContentText("Connected device automation is available")
+        .setContentText(if (localMode) "Embedded brain is running on this phone" else "Connected device automation is available")
         .setPriority(NotificationCompat.PRIORITY_LOW)
         .setOngoing(true)
         .setContentIntent(pendingIntent)
         .build(),
     )
     stopped = false
-    connect()
-    if (socket != null) emitStatus(currentStatus)
+    if (localMode) {
+      socket?.close(1000, "Switching to embedded brain")
+      socket = null
+      reconnect?.let(handler::removeCallbacks)
+      reconnect = null
+      emitStatus("Embedded brain running on phone")
+    } else {
+      connect()
+      if (socket != null) emitStatus(currentStatus)
+    }
     return START_STICKY
   }
 
   private fun connect() {
-    if (stopped || brainUrl.isBlank() || authToken.isBlank() || socket != null) return
+    if (localMode || stopped || brainUrl.isBlank() || authToken.isBlank() || socket != null) return
     emitStatus("Connecting…")
     val separator = if (brainUrl.contains('?')) "&" else "?"
     val request = Request.Builder()
@@ -229,11 +239,20 @@ class JarvisForegroundService : Service() {
   }
 
   fun sendDeviceObservation(kind: String, packageName: String, className: String, eventType: String, timestamp: Long) {
+    val label = appLabel(packageName)
+    JarvisEventBus.emit("device_observation", Arguments.createMap().apply {
+      putString("kind", kind)
+      putString("packageName", packageName)
+      putString("appLabel", label)
+      putString("className", className)
+      putString("eventType", eventType)
+      putDouble("timestamp", timestamp.toDouble())
+    })
     socket?.send(JSONObject()
       .put("type", "device_observation")
       .put("kind", kind)
       .put("packageName", packageName)
-      .put("appLabel", appLabel(packageName))
+      .put("appLabel", label)
       .put("className", className)
       .put("eventType", eventType)
       .put("timestamp", timestamp)
@@ -248,6 +267,10 @@ class JarvisForegroundService : Service() {
       .put("nodeTree", tree)
       .put("packageName", service?.currentPackageName().orEmpty())
       .put("lastActionResult", lastActionResult ?: JSONObject.NULL)
+    JarvisEventBus.emit("screen_state", Arguments.createMap().apply {
+      putString("nodeTreeJson", tree.toString())
+      putString("packageName", service?.currentPackageName().orEmpty())
+    })
     socket?.send(message.toString())
   }
 

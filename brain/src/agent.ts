@@ -1,8 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
-import type {ContentBlockParam, MessageParam} from '@anthropic-ai/sdk/resources/messages';
-import {GoogleGenAI} from '@google/genai';
 import {agentActionSchema, type AgentAction, type ScreenState} from './protocol.js';
-import {logEvent} from './logger.js';
+import type {LlmRuntime} from './llmRuntime.js';
 
 export interface HistoryStep {
   action: AgentAction;
@@ -57,17 +54,7 @@ function parseJsonObject(text: string): unknown {
 }
 
 export class AndroidAgent {
-  private readonly anthropic: Anthropic | null;
-  private readonly gemini: GoogleGenAI | null;
-
-  constructor(
-    private readonly provider: 'anthropic' | 'gemini',
-    apiKey: string,
-    private readonly model: string,
-  ) {
-    this.anthropic = provider === 'anthropic' ? new Anthropic({apiKey}) : null;
-    this.gemini = provider === 'gemini' ? new GoogleGenAI({apiKey}) : null;
-  }
+  constructor(private readonly runtime: LlmRuntime) {}
 
   async nextAction(
     instruction: string,
@@ -80,71 +67,26 @@ export class AndroidAgent {
       nodeTree: screen.nodeTree,
       lastActionResult: screen.lastActionResult ?? null,
     };
-    const content: ContentBlockParam[] = [
-      {
-        type: 'text',
-        text: JSON.stringify({
-          originalInstruction: instruction,
-          recentHistory: history.slice(-10),
-          currentScreenState: stateWithoutImage,
-          recentPhoneEvents,
-        }),
+    const prompt = JSON.stringify({
+      originalInstruction: instruction,
+      recentHistory: history.slice(-10),
+      currentScreenState: stateWithoutImage,
+      recentPhoneEvents,
+    });
+    const text = await this.runtime.generate({
+      system: SYSTEM_PROMPT,
+      prompt,
+      screenshotBase64: screen.screenshotBase64,
+      screenshotMediaType: screen.screenshotMediaType,
+      maxTokens: 1024,
+      temperature: 0,
+      responseMimeType: 'application/json',
+      metadata: {
+        instruction,
+        historyLength: history.length,
+        packageName: screen.packageName,
       },
-    ];
-
-    if (screen.screenshotBase64) {
-      content.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: screen.screenshotMediaType ?? 'image/png',
-          data: screen.screenshotBase64,
-        },
-      });
-    }
-
-    await logEvent({kind: 'llm_request', provider: this.provider, model: this.model, instruction, historyLength: history.length, packageName: screen.packageName});
-
-    let text: string;
-    if (this.provider === 'anthropic') {
-      const messages: MessageParam[] = [{role: 'user', content}];
-      const response = await this.anthropic!.messages.create({
-        model: this.model,
-        max_tokens: 1024,
-        temperature: 0,
-        system: SYSTEM_PROMPT,
-        messages,
-      });
-      text = response.content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('');
-    } else {
-      const parts: Array<{text: string} | {inlineData: {mimeType: string; data: string}}> = [
-        {text: content[0]!.type === 'text' ? content[0]!.text : ''},
-      ];
-      if (screen.screenshotBase64) {
-        parts.push({
-          inlineData: {
-            mimeType: screen.screenshotMediaType ?? 'image/png',
-            data: screen.screenshotBase64,
-          },
-        });
-      }
-      const response = await this.gemini!.models.generateContent({
-        model: this.model,
-        contents: [{role: 'user', parts}],
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-          maxOutputTokens: 1024,
-          temperature: 0,
-          responseMimeType: 'application/json',
-        },
-      });
-      text = response.text ?? '';
-    }
-
-    await logEvent({kind: 'llm_response', provider: this.provider, model: this.model, raw: text});
+    });
     try {
       return agentActionSchema.parse(parseJsonObject(text));
     } catch (error) {
