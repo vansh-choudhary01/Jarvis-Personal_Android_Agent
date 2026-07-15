@@ -60,6 +60,7 @@ const swipe = z.object({
 });
 const openApp = z.object({action: z.literal('open_app'), packageName: z.string(), ...progressFields});
 const listApps = z.object({action: z.literal('list_apps'), ...progressFields});
+const getDeviceProfile = z.object({action: z.literal('get_device_profile'), ...progressFields});
 const call = z.object({action: z.literal('call'), number: z.string(), ...progressFields});
 const getRecentCalls = z.object({action: z.literal('get_recent_calls'), limit: z.number().int().min(1).max(50), ...progressFields});
 const wait = z.object({action: z.literal('wait'), ms: z.number().int().min(0).max(30_000), ...progressFields});
@@ -73,6 +74,7 @@ export const agentActionSchema = z.discriminatedUnion('action', [
   swipe,
   openApp,
   listApps,
+  getDeviceProfile,
   call,
   getRecentCalls,
   wait,

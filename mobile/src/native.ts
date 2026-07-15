@@ -71,6 +71,7 @@ export interface NativeInstalledModel {
   installedSizeBytes: number;
   downloadedBytes: number;
   totalBytes: number;
+  runtime?: string;
   format?: string;
   storagePath?: string;
   benchmarkJson?: string;

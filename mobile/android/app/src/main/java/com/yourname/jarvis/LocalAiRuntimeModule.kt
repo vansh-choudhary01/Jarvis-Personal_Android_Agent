@@ -28,6 +28,8 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -39,10 +41,14 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   private val worker = Executors.newSingleThreadExecutor()
   private val downloads = ConcurrentHashMap<String, Call>()
   private val paused = ConcurrentHashMap<String, AtomicBoolean>()
+  private val lastProgressEmitAt = ConcurrentHashMap<String, Long>()
+  private val lastProgressEmitPercent = ConcurrentHashMap<String, Int>()
   private val modelRoot = File(context.filesDir, "jarvis_models")
 
   private var llm: Any? = null
+  private var liteRtEngine: Any? = null
   private var loadedModel: ModelRequest? = null
+  private var loadedProvider = "mediapipe"
   private var activeGeneration: Future<*>? = null
   private var cancelled = AtomicBoolean(false)
   private var promptTokens = 0
@@ -90,14 +96,15 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   @ReactMethod
   fun detectMediaPipe(promise: Promise) {
     val map = Arguments.createMap()
-    map.putString("provider", "mediapipe")
+    map.putString("provider", "local-ai")
     try {
       Class.forName("com.google.mediapipe.tasks.genai.llminference.LlmInference")
+      Class.forName("com.google.ai.edge.litertlm.Engine")
       map.putBoolean("available", true)
-      map.putString("reason", "MediaPipe LLM runtime is packaged.")
+      map.putString("reason", "MediaPipe LLM Inference and LiteRT-LM runtimes are packaged.")
     } catch (error: Throwable) {
       map.putBoolean("available", false)
-      map.putString("reason", "MediaPipe runtime is not available on this device.")
+      map.putString("reason", "Local AI runtime is not available on this device: ${rootCauseMessage(error)}")
     }
     promise.resolve(map)
   }
@@ -265,7 +272,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         setStatus(request.id, "loading")
         val started = SystemClock.elapsedRealtime()
         closeLoadedModel()
-        llm = createMediaPipeInference(file.absolutePath, maxTokens, temp.toFloat())
+        if (request.usesLiteRtLm()) {
+          liteRtEngine = createLiteRtLmEngine(file.absolutePath)
+          loadedProvider = "litert-lm"
+        } else {
+          llm = createMediaPipeInference(file.absolutePath, maxTokens, temp.toFloat())
+          loadedProvider = "mediapipe"
+        }
         loadedModel = request
         loadTimeMs = SystemClock.elapsedRealtime() - started
         temperature = temp
@@ -274,8 +287,9 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         snapshotPeakMemory()
         promise.resolve(true)
       } catch (error: Throwable) {
-        setFailure(request.id, "Model load failed: ${error.message ?: error.javaClass.simpleName}")
-        promise.reject("MODEL_LOAD_FAILED", "Model load failed: ${error.message ?: error.javaClass.simpleName}", error)
+        val message = rootCauseMessage(error)
+        setFailure(request.id, "Model load failed: $message")
+        promise.reject("MODEL_LOAD_FAILED", "Model load failed: $message", error)
       }
     }
   }
@@ -283,13 +297,18 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   @ReactMethod
   fun generate(prompt: String, maxTokens: Int, temp: Double, promise: Promise) {
     worker.execute {
+      var model: ModelRequest? = null
       try {
-        val model = ensureLoaded(maxTokens, temp)
-        setStatus(model.id, "running")
+        model = ensureLoaded(maxTokens, temp)
+        setStatus(model!!.id, "running")
         val started = SystemClock.elapsedRealtime()
         cancelled.set(false)
         promptTokens = estimateTokens(prompt)
-        val text = callGenerate(prompt)
+        val text = if (model!!.usesLiteRtLm()) {
+          callLiteRtLmGenerateWithTimeout(prompt, liteRtGenerationTimeoutMs(model))
+        } else {
+          callGenerate(prompt)
+        }
         generatedTokens = estimateTokens(text)
         val elapsed = max(1L, SystemClock.elapsedRealtime() - started)
         timeToFirstTokenMs = elapsed
@@ -297,12 +316,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         snapshotPeakMemory()
         val map = Arguments.createMap()
         map.putString("text", text)
-        map.putString("modelId", model.id)
+        map.putString("modelId", model!!.id)
         map.putInt("tokensGenerated", generatedTokens)
-        setStatus(model.id, "loaded")
+        setStatus(model!!.id, "loaded")
         promise.resolve(map)
       } catch (error: Throwable) {
-        promise.reject("GENERATION_FAILED", "Local generation failed: ${error.message ?: error.javaClass.simpleName}", error)
+        model?.id?.let { setStatus(it, "loaded") }
+        promise.reject("GENERATION_FAILED", "Local generation failed: ${rootCauseMessage(error)}", error)
       }
     }
   }
@@ -310,12 +330,24 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   @ReactMethod
   fun stream(prompt: String, maxTokens: Int, temp: Double, promise: Promise) {
     worker.execute {
+      var model: ModelRequest? = null
       try {
-        ensureLoaded(maxTokens, temp)
+        model = ensureLoaded(maxTokens, temp)
+        setStatus(model!!.id, "running")
         cancelled.set(false)
         promptTokens = estimateTokens(prompt)
         val started = SystemClock.elapsedRealtime()
-        val usedNativeStreaming = tryGenerateAsync(prompt)
+        val usedNativeStreaming = if (model?.usesLiteRtLm() == true) {
+          val text = callLiteRtLmGenerateWithTimeout(prompt, liteRtGenerationTimeoutMs(model))
+          generatedTokens = estimateTokens(text)
+          timeToFirstTokenMs = max(1L, SystemClock.elapsedRealtime() - started)
+          generationSpeed = generatedTokens * 1000.0 / max(1L, SystemClock.elapsedRealtime() - started)
+          emitToken(text)
+          emitDone()
+          true
+        } else {
+          tryGenerateAsync(prompt)
+        }
         if (!usedNativeStreaming) {
           val text = callGenerate(prompt)
           generatedTokens = estimateTokens(text)
@@ -325,10 +357,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
           emitDone()
         }
         snapshotPeakMemory()
+        model?.id?.let { setStatus(it, "loaded") }
         promise.resolve(true)
       } catch (error: Throwable) {
-        emitError("Local streaming failed: ${error.message ?: error.javaClass.simpleName}")
-        promise.reject("STREAM_FAILED", "Local streaming failed: ${error.message ?: error.javaClass.simpleName}", error)
+        val message = rootCauseMessage(error)
+        model?.id?.let { setStatus(it, "loaded") }
+        emitError("Local streaming failed: $message")
+        promise.reject("STREAM_FAILED", "Local streaming failed: $message", error)
       }
     }
   }
@@ -354,7 +389,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
 
   @ReactMethod
   fun isLoaded(promise: Promise) {
-    promise.resolve(llm != null && loadedModel != null)
+    promise.resolve((llm != null || liteRtEngine != null) && loadedModel != null)
   }
 
   @ReactMethod
@@ -367,6 +402,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     prefs.edit()
       .putLong("${model.id}:expected_bytes", model.expectedSizeBytes)
       .putString("${model.id}:file_name", model.fileName)
+      .putString("${model.id}:runtime", model.runtime)
       .remove("${model.id}:error")
       .apply()
 
@@ -376,6 +412,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     worker.execute {
       val part = partialFile(model.id)
       val downloaded = if (part.exists()) part.length() else 0L
+      emitProgress(model, "downloading", downloaded, model.expectedSizeBytes, percent(downloaded, model.expectedSizeBytes), null)
       val requestBuilder = Request.Builder().url(model.downloadUrl)
       if (downloaded > 0L) requestBuilder.addHeader("Range", "bytes=$downloaded-")
       prefs.getString("huggingface_token", null)?.takeIf { it.isNotBlank() }?.let {
@@ -425,14 +462,11 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         }
       } catch (error: Throwable) {
         if (paused[model.id]?.get() == true) return@execute
-        val message = error.message ?: error.javaClass.simpleName
-        val status = when {
-          error is LicenseRequiredException -> "needs_license_acceptance"
-          message.contains("Checksum", ignoreCase = true) -> "corrupted"
-          else -> "failed"
-        }
+        val root = rootCause(error)
+        val message = rootCauseMessage(error)
+        val status = if (root is LicenseRequiredException) "needs_license_acceptance" else modelStatusForError(message)
         setFailure(model.id, message, status)
-        emitProgress(model, "failed", part.length(), expectedBytes(model.id), progressFor(model.id), error.message)
+        emitProgress(model, "failed", part.length(), expectedBytes(model.id), progressFor(model.id), message)
       } finally {
         downloads.remove(model.id)
       }
@@ -453,7 +487,9 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       try {
         modelDir(model.id).mkdirs()
         setStatus(model.id, "installing")
-        val target = finalFile(model)
+        val targetFileName = importedModelFileName(model, displayName, extension)
+        val importModel = model.copy(fileName = targetFileName, format = extension)
+        val target = finalFile(importModel)
         if (target.exists()) target.delete()
         context.contentResolver.openInputStream(uri).use { input ->
           if (input == null) throw IllegalStateException("Could not open selected model file")
@@ -461,18 +497,19 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         }
         prefs.edit()
           .putLong("${model.id}:expected_bytes", target.length())
-          .putString("${model.id}:file_name", model.fileName)
+          .putString("${model.id}:file_name", targetFileName)
+          .putString("${model.id}:runtime", importModel.runtime)
           .putString("${model.id}:format", extension)
           .putString("${model.id}:imported_file_name", displayName)
           .putString("${model.id}:storage_path", target.absolutePath)
           .remove("${model.id}:error")
           .apply()
-        validateChecksumIfConfigured(model, target)
-        benchmarkAndValidate(model.copy(format = extension), target)
+        validateChecksumIfConfigured(importModel, target)
+        benchmarkAndValidate(importModel, target)
         promise.resolve(stateMap(model.id))
       } catch (error: Throwable) {
-        val message = error.message ?: error.javaClass.simpleName
-        setFailure(model.id, "Invalid model: $message", if (message.contains("Checksum", ignoreCase = true)) "corrupted" else "invalid_model")
+        val message = rootCauseMessage(error)
+        setFailure(model.id, "Invalid model: $message", modelStatusForError(message))
         promise.reject("MODEL_IMPORT_FAILED", "Model import failed: $message", error)
       }
     }
@@ -480,18 +517,33 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
 
   private fun benchmarkAndValidate(model: ModelRequest, file: File) {
     setStatus(model.id, "benchmarking")
+    if (model.usesLiteRtLm() && file.length() >= 3L * 1024L * 1024L * 1024L) {
+      prefs.edit()
+        .putString("${model.id}:runtime", model.runtime)
+        .putString("${model.id}:format", model.format)
+        .putString("${model.id}:storage_path", file.absolutePath)
+        .putString("active_model_id", model.id)
+        .apply()
+      setStatus(model.id, "ready")
+      return
+    }
     val initializedAt = SystemClock.elapsedRealtime()
     val beforeLoad = Debug.getNativeHeapAllocatedSize()
-    val inference = try {
-      createMediaPipeInference(file.absolutePath, 128, 0.3f)
+    val engineOrInference = try {
+      if (model.usesLiteRtLm()) createLiteRtLmEngine(file.absolutePath) else createMediaPipeInference(file.absolutePath, 128, 0.3f)
     } catch (error: Throwable) {
-      setFailure(model.id, "Unsupported or invalid model: ${error.message ?: error.javaClass.simpleName}", "invalid_model")
+      val message = rootCauseMessage(error)
+      setFailure(model.id, "Unsupported or invalid model: $message", modelStatusForError(message))
       throw error
     }
     val loadMs = SystemClock.elapsedRealtime() - initializedAt
     try {
       val generationStarted = SystemClock.elapsedRealtime()
-      val text = inference.javaClass.getMethod("generateResponse", String::class.java).invoke(inference, "Hello")?.toString() ?: ""
+      val text = if (model.usesLiteRtLm()) {
+        callLiteRtLmGenerate(engineOrInference, "Hello")
+      } else {
+        engineOrInference.javaClass.getMethod("generateResponse", String::class.java).invoke(engineOrInference, "Hello")?.toString() ?: ""
+      }
       val totalMs = max(1L, SystemClock.elapsedRealtime() - generationStarted)
       val tokens = estimateTokens(text)
       val currentRam = Debug.getNativeHeapAllocatedSize()
@@ -502,11 +554,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       loadTimeMs = loadMs
       timeToFirstTokenMs = totalMs
       generationSpeed = tokens * 1000.0 / totalMs
+      val backendLabel = if (model.usesLiteRtLm()) "LiteRT-LM CPU" else "MediaPipe Auto"
       val benchmarkJson = """
-        {"loadTimeMs":$loadMs,"timeToFirstTokenMs":$totalMs,"tokensPerSecond":$generationSpeed,"peakRamBytes":$peak,"currentRamBytes":$currentRam,"backend":"MediaPipe Auto","initializationTimeMs":$loadMs,"generatedTokens":$tokens,"validatedAt":"${Instant.now()}"}
+        {"loadTimeMs":$loadMs,"timeToFirstTokenMs":$totalMs,"tokensPerSecond":$generationSpeed,"peakRamBytes":$peak,"currentRamBytes":$currentRam,"backend":"$backendLabel","initializationTimeMs":$loadMs,"generatedTokens":$tokens,"validatedAt":"${Instant.now()}"}
       """.trimIndent()
       prefs.edit()
         .putString("${model.id}:benchmark_json", benchmarkJson)
+        .putString("${model.id}:runtime", model.runtime)
         .putString("${model.id}:format", model.format)
         .putString("${model.id}:storage_path", file.absolutePath)
         .putString("active_model_id", model.id)
@@ -514,7 +568,11 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       setStatus(model.id, "ready")
     } finally {
       try {
-        inference.javaClass.methods.firstOrNull { it.name == "close" && it.parameterCount == 0 }?.invoke(inference)
+        if (model.usesLiteRtLm()) {
+          closeReflective(engineOrInference)
+        } else {
+          engineOrInference.javaClass.methods.firstOrNull { it.name == "close" && it.parameterCount == 0 }?.invoke(engineOrInference)
+        }
       } catch (_: Throwable) {
         // Ignore close failures after validation.
       }
@@ -534,6 +592,36 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       ?: throw IllegalStateException("MediaPipe options were not created")
     return llmClass.getMethod("createFromOptions", Context::class.java, optionsClass).invoke(null, context, options)
       ?: throw IllegalStateException("MediaPipe inference runtime was not created")
+  }
+
+  private fun createLiteRtLmEngine(modelPath: String): Any {
+    val backendBaseClass = Class.forName("com.google.ai.edge.litertlm.Backend")
+    val cpuBackendClass = Class.forName("com.google.ai.edge.litertlm.Backend\$CPU")
+    val engineConfigClass = Class.forName("com.google.ai.edge.litertlm.EngineConfig")
+    val engineClass = Class.forName("com.google.ai.edge.litertlm.Engine")
+    val cpuBackend = cpuBackendClass.getConstructor().newInstance()
+    val config = engineConfigClass
+      .getConstructor(
+        String::class.java,
+        backendBaseClass,
+        backendBaseClass,
+        backendBaseClass,
+        Integer::class.java,
+        Integer::class.java,
+        String::class.java,
+      )
+      .newInstance(
+        modelPath,
+        cpuBackend,
+        null,
+        null,
+        null,
+        null,
+        context.cacheDir.absolutePath,
+      )
+    val engine = engineClass.getConstructor(engineConfigClass).newInstance(config)
+    engineClass.getMethod("initialize").invoke(engine)
+    return engine
   }
 
   private fun tryGenerateAsync(prompt: String): Boolean {
@@ -582,6 +670,64 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     return result?.toString() ?: ""
   }
 
+  private fun callLiteRtLmGenerate(prompt: String): String {
+    if (cancelled.get()) throw IllegalStateException("Generation cancelled")
+    val engine = liteRtEngine ?: throw IllegalStateException("No LiteRT-LM model is loaded")
+    val result = callLiteRtLmGenerate(engine, prompt)
+    if (cancelled.get()) throw IllegalStateException("Generation cancelled")
+    return result
+  }
+
+  private fun callLiteRtLmGenerateWithTimeout(prompt: String, timeoutMs: Long): String {
+    if (cancelled.get()) throw IllegalStateException("Generation cancelled")
+    val executor = Executors.newSingleThreadExecutor()
+    val future = executor.submit<String> { callLiteRtLmGenerate(prompt) }
+    activeGeneration = future
+    return try {
+      future.get(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (error: TimeoutException) {
+      future.cancel(true)
+      throw IllegalStateException("LiteRT-LM generation timed out after ${timeoutMs / 1000}s. This model is still too slow on the current backend; try a smaller LiteRT-LM model or a shorter prompt.")
+    } finally {
+      activeGeneration = null
+      executor.shutdownNow()
+    }
+  }
+
+  private fun liteRtGenerationTimeoutMs(model: ModelRequest?): Long {
+    val sizeBytes = model?.expectedSizeBytes?.takeIf { it > 0L } ?: model?.let { finalFile(it).length() } ?: 0L
+    return if (sizeBytes >= 3L * 1024L * 1024L * 1024L) 10L * 60L * 1000L else 3L * 60L * 1000L
+  }
+
+  private fun callLiteRtLmGenerate(engine: Any, prompt: String): String {
+    val conversationConfigClass = Class.forName("com.google.ai.edge.litertlm.ConversationConfig")
+    val conversationConfig = conversationConfigClass.getConstructor().newInstance()
+    val conversation = engine.javaClass.getMethod("createConversation", conversationConfigClass).invoke(engine, conversationConfig)
+      ?: throw IllegalStateException("LiteRT-LM conversation was not created")
+    return try {
+      val emptyContext = emptyMap<String, Any>()
+      val message = conversation.javaClass
+        .getMethod("sendMessage", String::class.java, Map::class.java)
+        .invoke(conversation, prompt, emptyContext)
+        ?: return ""
+      val rendered = conversation.javaClass
+        .getMethod("renderMessageIntoString", message.javaClass, Map::class.java)
+        .invoke(conversation, message, emptyContext)
+      rendered?.toString() ?: message.toString()
+    } finally {
+      closeReflective(conversation)
+    }
+  }
+
+  private fun closeReflective(target: Any?) {
+    if (target == null) return
+    try {
+      target.javaClass.methods.firstOrNull { it.name == "close" && it.parameterCount == 0 }?.invoke(target)
+    } catch (_: Throwable) {
+      // Ignore close failures; unloading should never crash the app.
+    }
+  }
+
   private fun ensureLoaded(maxTokens: Int, temp: Double): ModelRequest {
     val model = loadedModel
     if (llm != null && model != null) return model
@@ -593,6 +739,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
       "",
       "",
       fileName,
+      prefs.getString("${activeId}:runtime", if (fileName.endsWith(".litertlm")) "litert-lm" else "mediapipe") ?: "mediapipe",
       prefs.getString("${activeId}:format", fileName.substringAfterLast('.', "task")) ?: "task",
       "",
       expectedBytes(activeId),
@@ -600,7 +747,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     )
     val final = finalFile(request)
     if (!final.exists()) throw IllegalStateException("Active model file is missing")
-    llm = createMediaPipeInference(final.absolutePath, maxTokens, temp.toFloat())
+    if (request.usesLiteRtLm()) {
+      liteRtEngine = createLiteRtLmEngine(final.absolutePath)
+      loadedProvider = "litert-lm"
+    } else {
+      llm = createMediaPipeInference(final.absolutePath, maxTokens, temp.toFloat())
+      loadedProvider = "mediapipe"
+    }
     loadedModel = request
     return request
   }
@@ -612,7 +765,13 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     } catch (_: Throwable) {
       // Ignore close errors; unloading should never crash the app.
     }
+    try {
+      closeReflective(liteRtEngine)
+    } catch (_: Throwable) {
+      // Ignore close errors; unloading should never crash the app.
+    }
     llm = null
+    liteRtEngine = null
     loadedModel = null
     if (modelId != null && getStatus(modelId) == "loaded") setStatus(modelId, "ready")
   }
@@ -658,6 +817,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     map.putDouble("installedSizeBytes", if (final.exists()) final.length().toDouble() else 0.0)
     map.putDouble("downloadedBytes", downloaded.toDouble())
     map.putDouble("totalBytes", expected.toDouble())
+    map.putString("runtime", prefs.getString("${modelId}:runtime", if (final.extension.lowercase(Locale.US) == "litertlm") "litert-lm" else "mediapipe"))
     map.putString("format", prefs.getString("${modelId}:format", final.extension.lowercase(Locale.US)))
     map.putString("storagePath", prefs.getString("${modelId}:storage_path", final.absolutePath))
     map.putString("importedFileName", prefs.getString("${modelId}:imported_file_name", null))
@@ -671,12 +831,12 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     val model = loadedModel
     val runtime = Runtime.getRuntime()
     val usedBytes = runtime.totalMemory() - runtime.freeMemory()
-    map.putString("provider", "mediapipe")
+    map.putString("provider", loadedProvider)
     map.putString("currentModel", model?.displayName ?: "")
     map.putInt("contextLength", 8192)
-    map.putString("inferenceDevice", "MediaPipe Auto")
-    map.putString("backend", "MediaPipe Auto")
-    map.putString("accelerator", "MediaPipe backend selection")
+    map.putString("inferenceDevice", if (loadedProvider == "litert-lm") "LiteRT-LM CPU" else "MediaPipe Auto")
+    map.putString("backend", if (loadedProvider == "litert-lm") "LiteRT-LM CPU" else "MediaPipe Auto")
+    map.putString("accelerator", if (loadedProvider == "litert-lm") "LiteRT-LM backend selection" else "MediaPipe backend selection")
     map.putDouble("memoryUsageBytes", usedBytes.toDouble())
     map.putDouble("peakMemoryBytes", max(peakMemoryBytes, usedBytes).toDouble())
     map.putDouble("modelSizeBytes", model?.let { finalFile(it).length().toDouble() } ?: 0.0)
@@ -684,8 +844,8 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     map.putInt("generatedTokens", generatedTokens)
     map.putDouble("generationSpeedTokPerSec", generationSpeed)
     map.putDouble("temperature", temperature)
-    map.putBoolean("loaded", llm != null)
-    map.putString("hardwareAccelerationStatus", "Automatic when supported by MediaPipe")
+    map.putBoolean("loaded", llm != null || liteRtEngine != null)
+    map.putString("hardwareAccelerationStatus", if (loadedProvider == "litert-lm") "LiteRT-LM backend configured to CPU for compatibility" else "Automatic when supported by MediaPipe")
     map.putString("cpuUsage", "Process CPU not sampled")
     map.putDouble("timeToFirstTokenMs", timeToFirstTokenMs.toDouble())
     map.putDouble("loadTimeMs", loadTimeMs.toDouble())
@@ -697,6 +857,19 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   }
 
   private fun emitProgress(model: ModelRequest, status: String, downloaded: Long, total: Long, progress: Int, error: String?) {
+    if (status == "downloading") {
+      val now = SystemClock.elapsedRealtime()
+      val lastAt = lastProgressEmitAt[model.id] ?: 0L
+      val lastPercent = lastProgressEmitPercent[model.id] ?: -1
+      val enoughTimePassed = now - lastAt >= 500L
+      val meaningfulProgress = progress != lastPercent
+      if (!enoughTimePassed && !meaningfulProgress) return
+      lastProgressEmitAt[model.id] = now
+      lastProgressEmitPercent[model.id] = progress
+    } else {
+      lastProgressEmitAt.remove(model.id)
+      lastProgressEmitPercent.remove(model.id)
+    }
     val payload = Arguments.createMap()
     payload.putString("modelId", model.id)
     payload.putString("status", status)
@@ -727,6 +900,41 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     }
   }
 
+  private fun rootCause(error: Throwable): Throwable {
+    var current = error
+    val seen = mutableSetOf<Throwable>()
+    while (current.cause != null && current.cause !== current && !seen.contains(current.cause)) {
+      seen.add(current)
+      current = current.cause!!
+    }
+    return current
+  }
+
+  private fun rootCauseMessage(error: Throwable): String {
+    val root = rootCause(error)
+    val message = root.message?.takeIf { it.isNotBlank() } ?: root.javaClass.simpleName
+    if (message.contains("SentencePiece tokenizer is not found", ignoreCase = true)) {
+      return "Unsupported model package: tokenizer missing. Import a complete MediaPipe .task or LiteRT-LM .litertlm package that includes tokenizer assets."
+    }
+    return if (root === error) message else "$message (${error.javaClass.simpleName})"
+  }
+
+  private fun modelStatusForError(message: String): String = when {
+    message.contains("Checksum", ignoreCase = true) -> "corrupted"
+    message.contains("tokenizer missing", ignoreCase = true) -> "unsupported"
+    message.contains("unsupported", ignoreCase = true) -> "unsupported"
+    else -> "failed"
+  }
+
+  private fun importedModelFileName(model: ModelRequest, displayName: String, extension: String): String {
+    val base = displayName.substringBeforeLast('.', model.id)
+      .replace(Regex("[^A-Za-z0-9._-]+"), "-")
+      .trim('-', '.', '_')
+      .takeIf { it.isNotBlank() }
+      ?: model.id
+    return "$base.$extension"
+  }
+
   private fun percent(current: Long, total: Long): Int {
     if (total <= 0L) return 0
     return ((current.toDouble() / total.toDouble()) * 100).roundToInt().coerceIn(0, 100)
@@ -744,7 +952,16 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
   }
 
   private fun expectedBytes(modelId: String): Long = prefs.getLong("${modelId}:expected_bytes", 0L)
-  private fun getStatus(modelId: String): String = prefs.getString("${modelId}:status", null) ?: inferStatus(modelId)
+  private fun getStatus(modelId: String): String {
+    val stored = prefs.getString("${modelId}:status", null)
+    if (stored == "downloading" && !downloads.containsKey(modelId)) {
+      return if (partialFile(modelId).exists()) "paused" else inferStatus(modelId)
+    }
+    if ((stored == "benchmarking" || stored == "loading" || stored == "running") && loadedModel?.id != modelId && inferStatus(modelId) == "ready") {
+      return "ready"
+    }
+    return stored ?: inferStatus(modelId)
+  }
   private fun setStatus(modelId: String, status: String) = prefs.edit().putString("${modelId}:status", status).remove("${modelId}:error").apply()
   private fun setFailure(modelId: String, error: String, status: String = "failed") =
     prefs.edit().putString("${modelId}:status", status).putString("${modelId}:error", error).apply()
@@ -805,11 +1022,14 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
     val downloadUrl: String,
     val modelPageUrl: String,
     val fileName: String,
+    val runtime: String,
     val format: String,
     val checksumSha256: String,
     val expectedSizeBytes: Long,
     val licenseRequired: Boolean,
   ) {
+    fun usesLiteRtLm(): Boolean = runtime == "litert-lm" || format == "litertlm"
+
     companion object {
       fun from(map: ReadableMap): ModelRequest {
         val id = map.getString("id") ?: throw IllegalArgumentException("Model id is required")
@@ -820,6 +1040,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
           downloadUrl = map.getString("downloadUrl") ?: "",
           modelPageUrl = map.getString("modelPageUrl") ?: "",
           fileName = fileName,
+          runtime = map.getString("runtime") ?: if (fileName.endsWith(".litertlm")) "litert-lm" else "mediapipe",
           format = map.getString("format") ?: fileName.substringAfterLast('.', "task"),
           checksumSha256 = map.getString("checksumSha256") ?: "",
           expectedSizeBytes = if (map.hasKey("expectedSizeBytes")) map.getDouble("expectedSizeBytes").toLong() else 0L,
@@ -827,7 +1048,7 @@ class LocalAiRuntimeModule(private val context: ReactApplicationContext) : React
         )
       }
 
-      fun placeholder(modelId: String) = ModelRequest(modelId, modelId, "", "", "$modelId.task", "task", "", 0L, false)
+      fun placeholder(modelId: String) = ModelRequest(modelId, modelId, "", "", "$modelId.task", "mediapipe", "task", "", 0L, false)
     }
   }
 

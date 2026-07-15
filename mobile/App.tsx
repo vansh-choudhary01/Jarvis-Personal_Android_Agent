@@ -24,11 +24,31 @@ import {
   modelManager,
   refineRecommendationWithBenchmarks,
   recommendModel,
+  runtimeForModel,
   type InstalledModel,
   type ModelDefinition,
   type RuntimeDiagnostics,
   type RuntimeSettings,
 } from './src/localAiRuntime';
+
+type ModelProgressEvent = {
+  modelId?: string;
+  status?: InstalledModel['status'];
+  progress?: number;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  format?: string;
+  storagePath?: string;
+  importedFileName?: string;
+  error?: string;
+};
+
+const liveModelStatuses = new Set<InstalledModel['status']>([
+  'downloading',
+  'installing',
+  'benchmarking',
+  'loading',
+]);
 
 const emptyStatus: PermissionStatus = {
   accessibility: false,
@@ -219,7 +239,7 @@ function RuntimeSettingsScreen({
   const [models, setModels] = useState<InstalledModel[]>([]);
   const [storageUsedGB, setStorageUsedGB] = useState(0);
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(null);
-  const [testPrompt, setTestPrompt] = useState('Say hello from the local offline model in one sentence.');
+  const [testPrompt, setTestPrompt] = useState('Say: Hello from the local offline model.');
   const [testResult, setTestResult] = useState('');
   const [localRunPhase, setLocalRunPhase] = useState<'idle' | 'preparing' | 'loading' | 'thinking' | 'generating' | 'done' | 'failed'>('idle');
   const [thinkingDots, setThinkingDots] = useState('.');
@@ -236,6 +256,31 @@ function RuntimeSettingsScreen({
 
   const patchSettings = (patch: Partial<RuntimeSettings>) => setSettings(value => ({...value, ...patch}));
   const localModelBusy = localRunPhase === 'preparing' || localRunPhase === 'loading' || localRunPhase === 'thinking' || localRunPhase === 'generating';
+  const hasLiveModelWork = models.some(item => liveModelStatuses.has(item.status));
+
+  const mergeModelProgress = useCallback((event: ModelProgressEvent) => {
+    if (!event?.modelId) return;
+    setModels(previous => {
+      const existing = previous.find(item => item.modelId === event.modelId);
+      const next: InstalledModel = {
+        modelId: event.modelId!,
+        status: event.status ?? existing?.status ?? 'not_installed',
+        progress: Math.max(0, Math.min(100, Number(event.progress ?? existing?.progress ?? 0))),
+        active: existing?.active ?? false,
+        installedSizeGB: existing?.installedSizeGB ?? 0,
+        downloadedBytes: Number(event.downloadedBytes ?? existing?.downloadedBytes ?? 0),
+        totalBytes: Number(event.totalBytes ?? existing?.totalBytes ?? 0),
+        format: event.format ?? existing?.format,
+        storagePath: event.storagePath ?? existing?.storagePath,
+        importedFileName: event.importedFileName ?? existing?.importedFileName,
+        benchmark: existing?.benchmark,
+        error: event.error ?? existing?.error,
+      };
+      return existing
+        ? previous.map(item => item.modelId === event.modelId ? next : item)
+        : [...previous, next];
+    });
+  }, []);
 
   useEffect(() => {
     if (!localModelBusy) {
@@ -263,8 +308,12 @@ function RuntimeSettingsScreen({
 
   useEffect(() => {
     refreshRuntimeState();
-    const progressSub = DeviceEventEmitter.addListener('local_ai_model_progress', () => {
-      refreshRuntimeState();
+    const progressSub = DeviceEventEmitter.addListener('local_ai_model_progress', event => {
+      const progressEvent = event as ModelProgressEvent;
+      mergeModelProgress(progressEvent);
+      if (progressEvent.status && !liveModelStatuses.has(progressEvent.status)) {
+        refreshRuntimeState();
+      }
     });
     const doneSub = DeviceEventEmitter.addListener('local_ai_done', () => {
       refreshRuntimeState();
@@ -273,7 +322,15 @@ function RuntimeSettingsScreen({
       progressSub.remove();
       doneSub.remove();
     };
-  }, [refreshRuntimeState]);
+  }, [mergeModelProgress, refreshRuntimeState]);
+
+  useEffect(() => {
+    if (!hasLiveModelWork) return;
+    const timer = setInterval(() => {
+      refreshRuntimeState();
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [hasLiveModelWork, refreshRuntimeState]);
 
   const getState = (modelId: string): InstalledModel => models.find(item => item.modelId === modelId) ?? {
     modelId,
@@ -317,8 +374,14 @@ function RuntimeSettingsScreen({
       setTestResult('Thinking locally...');
       let streamedText = '';
       let firstTokenAt = 0;
+      const offlinePrompt = [
+        'Reply with the final answer only.',
+        'Do not include chain-of-thought, analysis, or <think> tags.',
+        'Keep the answer to one short sentence.',
+        `User request: ${testPrompt.trim()}`,
+      ].join('\n');
       setLocalRunPhase('generating');
-      for await (const token of runtimeAdapter.stream({prompt: testPrompt.trim(), maxTokens: 256, temperature: 0.3})) {
+      for await (const token of runtimeAdapter.stream({prompt: offlinePrompt, maxTokens: 96, temperature: 0.2, timeoutMs: 10 * 60 * 1000})) {
         if (!firstTokenAt) firstTokenAt = Date.now();
         streamedText += token;
         setTestResult(streamedText);
@@ -393,18 +456,34 @@ function RuntimeSettingsScreen({
           <RuntimeRow label="Reason" value={recommendation.reason} />
           <RuntimeRow label="Estimated Storage" value={`${recommendation.model.installedSizeGB} GB`} />
           <RuntimeRow label="Estimated Memory" value={`~${recommendation.estimatedMemoryGB} GB during inference`} />
-          <RuntimeRow label="License" value={recommendation.model.licenseRequired ? 'Accept once, then use saved HF token for one-tap download' : 'Direct download available'} />
+          <RuntimeRow
+            label="Install"
+            value={
+              recommendation.model.downloadUrl
+                ? recommendation.model.licenseRequired
+                  ? 'Accept once, then use saved HF token for one-tap download'
+                  : 'Direct download available'
+                : 'Import a complete local model package'
+            }
+          />
+          {!!recommendation.model.downloadDisabledReason && <Text style={runtime.helpText}>{recommendation.model.downloadDisabledReason}</Text>}
           <Pressable
             style={runtime.primaryButton}
             onPress={() => {
               setSelectedModelId(recommendation.model.id);
               runModelAction(
                 recommendation.model.id,
-                () => modelManager.install(recommendation.model).then(() => undefined),
-                'Download started. Jarvis picked the exact official model file and will validate it after install.',
+                () => (
+                  recommendation.model.downloadUrl
+                    ? modelManager.install(recommendation.model)
+                    : modelManager.importFromPicker(recommendation.model)
+                ).then(() => undefined),
+                recommendation.model.downloadUrl
+                  ? 'Download started. Jarvis picked the exact official model file and will validate it after install.'
+                  : 'Select the complete converted model package. Jarvis will validate and benchmark it after import.',
               );
             }}>
-            <Text style={runtime.primaryButtonText}>Download Recommended Model</Text>
+            <Text style={runtime.primaryButtonText}>{recommendation.model.downloadUrl ? 'Download Recommended Model' : 'Import Recommended Model'}</Text>
           </Pressable>
         </RuntimeSection>
       )}
@@ -454,7 +533,8 @@ function RuntimeSettingsScreen({
         <RuntimeRow label="Storage Used" value={`${storageUsedGB.toFixed(1)} GB`} />
         {MODEL_REGISTRY.map(model => {
           const state = getState(model.id);
-          const canDownload = state.status === 'not_installed' || state.status === 'failed';
+          const hasDirectDownload = !!model.downloadUrl.trim();
+          const canDownload = hasDirectDownload && (state.status === 'not_installed' || state.status === 'failed');
           const canResume = state.status === 'paused';
           const canDelete = state.status !== 'not_installed';
           const isReady = state.status === 'ready' || state.status === 'loaded';
@@ -464,9 +544,18 @@ function RuntimeSettingsScreen({
                 <Text style={runtime.modelTitle}>{model.displayName}</Text>
                 <Text style={runtime.modelStatus}>{state.active ? 'Active' : statusLabel(state.status)}</Text>
               </View>
-              <Text style={runtime.modelMeta}>{model.installedSizeGB} GB - {runtimeLabel(model.runtime)} - {model.parameters} - .{model.format}</Text>
+              <Text style={runtime.modelMeta}>{model.installedSizeGB} GB - {runtimeLabel(runtimeForModel(model))} - {model.parameters} - .{model.format}</Text>
+              {!!model.downloadDisabledReason && <Text style={runtime.helpText}>{model.downloadDisabledReason}</Text>}
+              {!!model.importInstructions && <Text style={runtime.helpText}>{model.importInstructions}</Text>}
               {(state.status === 'downloading' || state.status === 'installing' || state.status === 'paused') && (
-                <Text style={runtime.progressText}>{state.progress}% - {formatBytes(state.downloadedBytes)} / {formatBytes(state.totalBytes || model.downloadSizeGB * 1024 * 1024 * 1024)}</Text>
+                <View style={runtime.progressBlock}>
+                  <View style={runtime.progressTrack}>
+                    <View style={[runtime.progressFill, {width: `${Math.max(2, Math.min(100, state.progress))}%`}]} />
+                  </View>
+                  <Text style={runtime.progressText}>
+                    {statusLabel(state.status)} - {state.progress}% - {formatBytes(state.downloadedBytes)} / {formatBytes(state.totalBytes || model.downloadSizeGB * 1024 * 1024 * 1024)}
+                  </Text>
+                </View>
               )}
               {!!state.benchmark && (
                 <Text style={runtime.progressText}>{state.benchmark.tokensPerSecond.toFixed(1)} tok/s - load {Math.round(state.benchmark.loadTimeMs)}ms - TTFT {Math.round(state.benchmark.timeToFirstTokenMs)}ms</Text>
@@ -484,7 +573,7 @@ function RuntimeSettingsScreen({
                   onPress={() => runModelAction(model.id, () => modelManager.importFromPicker(model).then(() => undefined), 'Imported, validated, benchmarked, and stored in Jarvis private storage.')}
                 />
                 <SmallAction
-                  label={busyModelId === model.id ? 'Working' : canResume ? 'Resume' : 'Download'}
+                  label={busyModelId === model.id ? 'Working' : canResume ? 'Resume' : hasDirectDownload ? 'Download' : 'Import Required'}
                   disabled={busyModelId === model.id || (!canDownload && !canResume)}
                   onPress={() => runModelAction(
                     model.id,
@@ -644,9 +733,12 @@ function ModelDetails({model}: {model: ModelDefinition}): React.JSX.Element {
       <RuntimeRow label="Family" value={model.family} />
       <RuntimeRow label="Parameters" value={model.parameters} />
       <RuntimeRow label="Quantization" value={model.quantization} />
-      <RuntimeRow label="Runtime" value={runtimeLabel(model.runtime)} />
+      <RuntimeRow label="Runtime" value={runtimeLabel(runtimeForModel(model))} />
       <RuntimeRow label="Format" value={`.${model.format}`} />
       <RuntimeRow label="License" value={model.licenseRequired ? 'Needs acceptance on official model page' : 'No gated license flow'} />
+      <RuntimeRow label="Install Method" value={model.downloadUrl ? 'Direct download or import' : 'Import complete local package'} />
+      {!!model.downloadDisabledReason && <Text style={runtime.helpText}>{model.downloadDisabledReason}</Text>}
+      {!!model.importInstructions && <Text style={runtime.helpText}>{model.importInstructions}</Text>}
       <RuntimeRow label="Download Size" value={`${model.downloadSizeGB} GB`} />
       <RuntimeRow label="Installed Size" value={`${model.installedSizeGB} GB`} />
       <RuntimeRow label="Recommended RAM" value={`${model.recommendedRamGB} GB`} />
@@ -663,6 +755,7 @@ function ModelDetails({model}: {model: ModelDefinition}): React.JSX.Element {
 }
 
 function runtimeLabel(value: string): string {
+  if (value === 'litert-lm') return 'LiteRT-LM';
   if (value === 'mlc-llm') return 'MLC LLM';
   if (value === 'llama.cpp') return 'llama.cpp';
   if (value === 'google-ai-edge') return 'Google AI Edge';
@@ -707,6 +800,7 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
   const [log, setLog] = useState<LogEntry[]>([]);
   const [nodeTree, setNodeTree] = useState('');
   const [nodeExpanded, setNodeExpanded] = useState(false);
+  const [expandedTrace, setExpandedTrace] = useState<Record<number, boolean>>({});
 
   useEffect(() => JarvisController.subscribeLog(setLog), []);
 
@@ -731,6 +825,12 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
   };
 
   const permRows = Object.entries(permissions) as [keyof PermissionStatus, boolean][];
+  const latestModel = log.find(entry => entry.kind.includes('llm_') || entry.kind.includes('planner_'));
+  const latestAction = log.find(entry => entry.kind.includes('action') || entry.kind === 'complete' || entry.kind === 'failed');
+  const latestScreen = log.find(entry => entry.kind.includes('screen'));
+  const latestStream = log.find(entry => entry.kind === 'llm_stream_chunk' || entry.kind === 'llm_stream_done' || entry.kind === 'llm_generate_result');
+  const liveStreamText = readStreamText(latestStream);
+  const trace = log.slice(0, 80);
 
   return (
     <View style={dev.container}>
@@ -740,6 +840,7 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
       <DevSection title="Connection">
         <DevRow label="Status" value={connection} />
         <DevRow label="Brain" value="Embedded TypeScript runtime via BrainRuntime" />
+        <DevRow label="Current Phase" value={log[0]?.kind ?? 'idle'} />
       </DevSection>
 
       {/* Permissions */}
@@ -765,15 +866,36 @@ function DevScreen({connection, permissions}: {connection: string; permissions: 
         {!!submitResult && <Text style={dev.mono}>{submitResult}</Text>}
       </DevSection>
 
-      {/* Action log */}
-      <DevSection title={`Action Log (last ${log.length})`}>
-        {log.length === 0 && <Text style={dev.empty}>No entries yet.</Text>}
-        {log.slice(0, 20).map((entry, i) => (
-          <View key={i} style={dev.logRow}>
-            <Text style={dev.logKind}>{entry.kind}</Text>
-            <Text style={dev.logDetail} numberOfLines={2}>{entry.detail}</Text>
-            <Text style={dev.logTs}>{new Date(entry.ts).toLocaleTimeString()}</Text>
+      {/* Observability */}
+      <DevSection title="System Observability">
+        <Text style={dev.empty}>
+          Live trace of the embedded Brain, local model, native bridge, screen capture, planner parse, repair attempts, and action execution.
+        </Text>
+        <View style={dev.liveStreamCard}>
+          <View style={dev.liveStreamHeader}>
+            <Text style={dev.liveStreamTitle}>Model Output Stream</Text>
+            <Text style={dev.liveStreamBadge}>{latestStream?.kind === 'llm_stream_chunk' ? 'LIVE' : latestStream ? 'READY' : 'WAITING'}</Text>
           </View>
+          <Text style={dev.liveStreamText} selectable>
+            {liveStreamText || 'Run a task to see the local model output as it streams.'}
+          </Text>
+        </View>
+        <View style={dev.traceSummary}>
+          <TraceSummary label="Model" entry={latestModel} />
+          <TraceSummary label="Action" entry={latestAction} />
+          <TraceSummary label="Screen" entry={latestScreen} />
+        </View>
+      </DevSection>
+
+      <DevSection title={`System Trace (last ${trace.length})`}>
+        {trace.length === 0 && <Text style={dev.empty}>No trace entries yet.</Text>}
+        {trace.map((entry, i) => (
+          <TraceRow
+            key={`${entry.ts}-${i}`}
+            entry={entry}
+            expanded={!!expandedTrace[entry.ts]}
+            onToggle={() => setExpandedTrace(value => ({...value, [entry.ts]: !value[entry.ts]}))}
+          />
         ))}
       </DevSection>
 
@@ -816,6 +938,57 @@ function DevRow({label, value, valueOk}: {label: string; value: string; valueOk?
 }
 
 // ─── Checklist row ────────────────────────────────────────────────────────────
+
+function TraceSummary({label, entry}: {label: string; entry?: LogEntry}): React.JSX.Element {
+  return (
+    <View style={dev.traceSummaryCard}>
+      <Text style={dev.traceSummaryLabel}>{label}</Text>
+      <Text style={dev.traceSummaryKind} numberOfLines={1}>{entry?.kind ?? '—'}</Text>
+      <Text style={dev.traceSummaryDetail} numberOfLines={2}>{entry?.detail ?? 'Waiting for activity'}</Text>
+    </View>
+  );
+}
+
+function TraceRow({entry, expanded, onToggle}: {entry: LogEntry; expanded: boolean; onToggle: () => void}): React.JSX.Element {
+  const tone = traceTone(entry.kind);
+  return (
+    <Pressable style={dev.traceRow} onPress={onToggle}>
+      <View style={dev.traceTop}>
+        <View style={[dev.traceDot, tone === 'good' && dev.traceDotGood, tone === 'bad' && dev.traceDotBad, tone === 'model' && dev.traceDotModel]} />
+        <View style={dev.traceCopy}>
+          <Text style={dev.traceKind}>{entry.kind}</Text>
+          <Text style={dev.traceDetail} numberOfLines={expanded ? 8 : 2}>{entry.detail}</Text>
+        </View>
+        <Text style={dev.traceTime}>{new Date(entry.ts).toLocaleTimeString()}</Text>
+      </View>
+      {expanded && entry.data != null && (
+        <Text style={dev.traceData}>{formatTraceData(entry.data)}</Text>
+      )}
+    </Pressable>
+  );
+}
+
+function traceTone(kind: string): 'default' | 'good' | 'bad' | 'model' {
+  if (kind.includes('failed') || kind.includes('error')) return 'bad';
+  if (kind.includes('success') || kind === 'complete' || kind.includes('done')) return 'good';
+  if (kind.includes('llm') || kind.includes('planner') || kind.includes('model')) return 'model';
+  return 'default';
+}
+
+function formatTraceData(data: unknown): string {
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return String(data);
+  }
+}
+
+function readStreamText(entry?: LogEntry): string {
+  const data = entry?.data as {text?: unknown; outputPreview?: unknown} | undefined;
+  if (typeof data?.text === 'string') return data.text;
+  if (typeof data?.outputPreview === 'string') return data.outputPreview;
+  return '';
+}
 
 interface ChecklistRowProps {
   number: string;
@@ -901,6 +1074,9 @@ const runtime = StyleSheet.create({
   modelTitle: {fontSize: 14, fontWeight: '700', color: '#24221D', flex: 1},
   modelStatus: {fontSize: 11, color: '#5A554D', fontWeight: '700'},
   modelMeta: {fontSize: 12, color: '#716B61', marginTop: 4},
+  progressBlock: {marginTop: 8},
+  progressTrack: {height: 8, borderRadius: 999, backgroundColor: '#DED8CC', overflow: 'hidden'},
+  progressFill: {height: 8, borderRadius: 999, backgroundColor: '#2A4FD4'},
   progressText: {fontSize: 11, color: '#2A4FD4', marginTop: 5, fontVariant: ['tabular-nums']},
   errorText: {fontSize: 11, color: '#8B3A3A', marginTop: 5, lineHeight: 16},
   helpText: {fontSize: 12, color: '#716B61', lineHeight: 18, marginBottom: 10},
@@ -947,6 +1123,27 @@ const dev = StyleSheet.create({
   logTs: {fontSize: 9, color: '#999', marginTop: 2},
   empty: {fontSize: 12, color: '#999', fontStyle: 'italic'},
   toggleLink: {fontSize: 12, color: '#2A4FD4', marginTop: 8, fontWeight: '600'},
+  liveStreamCard: {marginTop: 12, backgroundColor: '#171713', borderRadius: 12, padding: 12},
+  liveStreamHeader: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10},
+  liveStreamTitle: {fontSize: 12, color: '#F4F1EA', fontWeight: '800', letterSpacing: 0.8},
+  liveStreamBadge: {fontSize: 9, color: '#171713', backgroundColor: '#BFE6C8', borderRadius: 999, overflow: 'hidden', paddingHorizontal: 8, paddingVertical: 4, fontWeight: '900'},
+  liveStreamText: {marginTop: 10, color: '#F4F1EA', fontFamily: 'monospace', fontSize: 11, lineHeight: 16},
+  traceSummary: {flexDirection: 'row', gap: 8, marginTop: 12},
+  traceSummaryCard: {flex: 1, backgroundColor: '#FAF8F4', borderRadius: 10, borderWidth: 1, borderColor: '#D7D0C4', padding: 10},
+  traceSummaryLabel: {fontSize: 9, color: '#746E62', fontWeight: '800', letterSpacing: 1.1},
+  traceSummaryKind: {fontSize: 11, color: '#2A4FD4', fontWeight: '800', marginTop: 4},
+  traceSummaryDetail: {fontSize: 11, color: '#4C4740', lineHeight: 15, marginTop: 3},
+  traceRow: {paddingVertical: 9, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: '#CCC7BC'},
+  traceTop: {flexDirection: 'row', alignItems: 'flex-start', gap: 9},
+  traceDot: {width: 9, height: 9, borderRadius: 9, backgroundColor: '#8A8377', marginTop: 4},
+  traceDotGood: {backgroundColor: '#294D3B'},
+  traceDotBad: {backgroundColor: '#8B3A3A'},
+  traceDotModel: {backgroundColor: '#2A4FD4'},
+  traceCopy: {flex: 1},
+  traceKind: {fontSize: 10, color: '#2A4FD4', fontWeight: '800', letterSpacing: 0.7},
+  traceDetail: {fontSize: 12, color: '#24221D', lineHeight: 17, marginTop: 2},
+  traceTime: {fontSize: 9, color: '#8A8377', fontVariant: ['tabular-nums'], marginTop: 1},
+  traceData: {marginTop: 8, padding: 9, borderRadius: 8, backgroundColor: '#171713', color: '#F4F1EA', fontSize: 10, lineHeight: 15, fontFamily: 'monospace'},
 });
 
 export default App;

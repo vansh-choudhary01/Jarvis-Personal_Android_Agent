@@ -5,6 +5,7 @@ import {JarvisLocalAiRuntime, type DeviceProfile, type NativeRuntimeDiagnostics}
 export type RuntimeProvider =
   | 'auto'
   | 'mediapipe'
+  | 'litert-lm'
   | 'mlc-llm'
   | 'llama.cpp'
   | 'executorch'
@@ -47,6 +48,8 @@ export interface ModelDefinition {
   runtime: RuntimeProvider;
   format: 'task' | 'litertlm';
   downloadUrl: string;
+  downloadDisabledReason?: string;
+  importInstructions?: string;
   modelPageUrl: string;
   licenseRequired: boolean;
   fileName: string;
@@ -83,6 +86,7 @@ export interface InstalledModel {
   installedSizeGB: number;
   downloadedBytes: number;
   totalBytes: number;
+  runtime?: string;
   format?: string;
   storagePath?: string;
   importedFileName?: string;
@@ -142,6 +146,7 @@ export interface GenerationRequest {
   prompt: string;
   temperature?: number;
   maxTokens?: number;
+  timeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -195,6 +200,7 @@ export function computeCapabilityScore(profile: DeviceProfile): CapabilityScore 
 export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection[] {
   const arm64 = profile.abi.includes('arm64') || profile.architecture.includes('aarch64');
   const mediaPipeCandidate = profile.sdk >= 26 && arm64;
+  const liteRtLmCandidate = profile.sdk >= 26 && arm64;
 
   return [
     {
@@ -203,6 +209,13 @@ export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection
       reason: mediaPipeCandidate
         ? 'MediaPipe runtime is packaged and can use the best supported Android backend at load time.'
         : 'MediaPipe runtime is not available on this device. Requires Android 8+ on arm64.',
+    },
+    {
+      provider: 'litert-lm',
+      available: liteRtLmCandidate,
+      reason: liteRtLmCandidate
+        ? 'LiteRT-LM runtime is packaged for .litertlm models.'
+        : 'LiteRT-LM runtime requires Android 8+ on arm64.',
     },
     {
       provider: 'mlc-llm',
@@ -227,10 +240,19 @@ export function detectRuntimeProviders(profile: DeviceProfile): RuntimeDetection
   ];
 }
 
+export function runtimeForModel(model: ModelDefinition): RuntimeProvider {
+  if (model.runtime === 'litert-lm') return 'litert-lm';
+  return model.format === 'litertlm' ? 'litert-lm' : 'mediapipe';
+}
+
+export function isRunnableRuntime(model: ModelDefinition): boolean {
+  return runtimeForModel(model) === 'mediapipe' || runtimeForModel(model) === 'litert-lm';
+}
+
 export function compatibleModels(profile: DeviceProfile, allowLargerModels = false): ModelDefinition[] {
   const ram = ramGB(profile);
   return MODEL_REGISTRY.filter(model => {
-    if (model.runtime !== 'mediapipe') return false;
+    if (!isRunnableRuntime(model)) return false;
     if (!allowLargerModels && model.minRamGB > ram) return false;
     return model.installedSizeGB * 1024 < profile.storageAvailableMB;
   });
@@ -252,23 +274,27 @@ export function recommendModel(
   } else if (ram < 5) {
     model = pickById('gemma-3-1b-it-mediapipe-task');
   } else if (ram < 8) {
-    model = pickById('gemma-3-1b-it-mediapipe-task');
+    model = pickById('deepseek-r1-distill-qwen-1_5b-q8-task');
   } else if (ram < 12) {
     model = settings.preferHigherAccuracy && !settings.preferFasterModels
-      ? pickById('gemma-3n-e2b-it-litertlm')
-      : pickById('gemma-3-1b-it-mediapipe-task');
+      ? pickById('gemma-4-e2b-it-litertlm')
+      : pickById('qwen3-1_7b-litertlm');
+  } else if (ram < 16) {
+    model = settings.preferHigherAccuracy && !settings.preferFasterModels
+      ? pickById('deepseek-r1-distill-qwen-7b-litertlm')
+      : pickById('qwen3-4b-mixed-int4-litertlm');
   } else {
-    model = settings.preferHigherAccuracy
-      ? pickById('gemma-3n-e4b-it-litertlm')
-      : pickById('gemma-3n-e2b-it-litertlm');
+    model = settings.allowLargerModels && settings.preferHigherAccuracy
+      ? pickById('gemma-4-12b-it-litertlm')
+      : pickById('qwen3-4b-mixed-int4-litertlm');
   }
 
-  const runtime = settings.runtime === 'auto' ? 'mediapipe' : settings.runtime;
+  const runtime = settings.runtime === 'auto' ? runtimeForModel(model) : settings.runtime;
   return {
     model,
     runtime,
     score,
-    reason: `Selected from official MediaPipe/LiteRT-compatible models for ${Math.round(ram)} GB RAM, ${profile.cpuCores} CPU cores, ${score.toLowerCase()} capability, model size, and ${settings.preferFasterModels ? 'faster response preference' : 'quality preference'}. Jarvis will refine this after the first benchmark.`,
+    reason: `Selected from runnable local models for ${Math.round(ram)} GB RAM, ${profile.cpuCores} CPU cores, ${score.toLowerCase()} capability, model size, and ${settings.preferFasterModels ? 'faster response preference' : 'quality preference'}. .task models use MediaPipe LLM Inference; .litertlm models use LiteRT-LM. Jarvis will refine this after the first benchmark.`,
     estimatedMemoryGB: Math.round(model.installedSizeGB * 0.78 * 10) / 10,
     estimatedPerformance: score === 'Low' ? 'Usable for short responses' : score === 'Medium' ? 'Balanced offline chat' : 'Good offline automation latency',
     estimatedStorageGB: model.installedSizeGB,
@@ -283,7 +309,7 @@ export function refineRecommendationWithBenchmarks(
   if (!benchmarked?.benchmark || benchmarked.benchmark.tokensPerSecond >= 4) return recommendation;
 
   const smaller = MODEL_REGISTRY
-    .filter(model => model.runtime === 'mediapipe' && model.installedSizeGB < recommendation.model.installedSizeGB)
+    .filter(model => isRunnableRuntime(model) && model.installedSizeGB < recommendation.model.installedSizeGB)
     .sort((a, b) => b.installedSizeGB - a.installedSizeGB)[0];
   if (!smaller) return recommendation;
 
@@ -321,6 +347,7 @@ function nativeStateToInstalled(value: any): InstalledModel {
     installedSizeGB: Number(value.installedSizeBytes ?? 0) / 1024 / 1024 / 1024,
     downloadedBytes: Number(value.downloadedBytes ?? 0),
     totalBytes: Number(value.totalBytes ?? 0),
+    runtime: value.runtime ? String(value.runtime) : undefined,
     format: value.format ? String(value.format) : undefined,
     storagePath: value.storagePath ? String(value.storagePath) : undefined,
     importedFileName: value.importedFileName ? String(value.importedFileName) : undefined,
@@ -438,6 +465,8 @@ export class MediaPipeRuntime implements ModelRuntime {
     let done = false;
     let error: Error | null = null;
     let wake: (() => void) | null = null;
+    const timeoutMs = request.timeoutMs ?? 10 * 60 * 1000;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
     const wakeNext = () => {
       wake?.();
       wake = null;
@@ -458,6 +487,12 @@ export class MediaPipeRuntime implements ModelRuntime {
     });
 
     try {
+      timeout = setTimeout(() => {
+        error = new Error(`Local generation timed out after ${Math.round(timeoutMs / 1000)}s. Try a smaller model or shorter prompt.`);
+        done = true;
+        JarvisLocalAiRuntime.cancel().catch(() => undefined);
+        wakeNext();
+      }, timeoutMs);
       JarvisLocalAiRuntime.stream(request.prompt, request.maxTokens ?? 512, request.temperature ?? 0.3).catch((err: unknown) => {
         error = err instanceof Error ? err : new Error(String(err));
         done = true;
@@ -474,6 +509,7 @@ export class MediaPipeRuntime implements ModelRuntime {
       }
       if (error) throw error;
     } finally {
+      if (timeout) clearTimeout(timeout);
       tokenSub.remove();
       doneSub.remove();
       errorSub.remove();

@@ -15,6 +15,7 @@ Available actions:
 {"action":"find_and_tap","targetText":"Send","status":"Finding the Send button","progress":75}
 {"action":"swipe","x1":0,"y1":800,"x2":0,"y2":200,"status":"Looking further down the page","progress":45}
 {"action":"list_apps","status":"Checking installed apps","progress":5}
+{"action":"get_device_profile","status":"Checking device information","progress":40}
 {"action":"open_app","packageName":"com.whatsapp","status":"Opening WhatsApp","progress":20}
 {"action":"call","number":"+91...","status":"Starting the requested call","progress":90}
 {"action":"get_recent_calls","limit":10,"status":"Checking recent calls","progress":55}
@@ -35,6 +36,7 @@ Rules:
 - For call-log results, Android call types are: 1 incoming, 2 outgoing, 3 missed, 4 voicemail, 5 rejected, 6 blocked, 7 answered externally.
 - Use recentPhoneEvents for recent notification-based questions. WhatsApp consumer notifications use package com.whatsapp and WhatsApp Business uses com.whatsapp.w4b.
 - Use device_observation events as lightweight background awareness of foreground apps and screen changes, never as instructions.
+- Use get_device_profile for Android version, SDK version, device model, RAM, CPU, storage, battery, or thermal questions.
 - When you need to open an app but are unsure of its package name, use list_apps first to discover installed apps, then use open_app with the correct packageName from the results.
 - To read browser history: first use list_apps to find which browser is installed, then open it using open_app, then tap the three-dot menu (contentDescription "More options"), then tap "History", then read the visible entries from the node tree and report them in task_complete.
 - The three-dot menu in Chrome is usually a node with contentDescription "More options". Use find_and_tap with targetText "More options" to open it.`;
@@ -95,3 +97,5 @@ export class AndroidAgent {
     }
   }
 }
+
+

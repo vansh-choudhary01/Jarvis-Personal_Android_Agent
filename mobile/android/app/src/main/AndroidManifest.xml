@@ -28,6 +28,9 @@
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
       android:supportsRtl="true">
+      <uses-native-library android:name="libvndksupport.so" android:required="false" />
+      <uses-native-library android:name="libOpenCL.so" android:required="false" />
+
       <service
         android:name=".JarvisAccessibilityService"
         android:label="Jarvis device control"

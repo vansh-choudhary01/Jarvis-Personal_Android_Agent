@@ -112,6 +112,7 @@ dependencies {
     implementation("com.facebook.react:react-android")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.mediapipe:tasks-genai:0.10.27")
+    runtimeOnly("com.google.ai.edge.litertlm:litertlm-android:0.12.0")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
