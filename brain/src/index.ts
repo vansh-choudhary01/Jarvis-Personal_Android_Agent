@@ -1,10 +1,13 @@
 import 'dotenv/config';
 import {createServer} from 'node:http';
 import {URL} from 'node:url';
+import type WebSocket from 'ws';
 import {WebSocketServer} from 'ws';
-import {AndroidAgent} from './agent.js';
+import {CloudLlmRuntime} from './llmRuntime.js';
+import {installNodeFileLogger} from './nodeLogger.js';
+import type {PhoneTransport} from './phoneTransport.js';
 import {phoneMessageSchema} from './protocol.js';
-import {TaskManager} from './taskManager.js';
+import {BrainRuntime} from './runtime.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const provider = process.env.AI_PROVIDER === 'gemini' ? 'gemini' : 'anthropic';
@@ -18,7 +21,32 @@ if (!apiKey || !authToken) {
   throw new Error(`${provider === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'} and PHONE_AUTH_TOKEN are required`);
 }
 
-const manager = new TaskManager(new AndroidAgent(provider, apiKey, model));
+installNodeFileLogger();
+
+const brain = new BrainRuntime({
+  llm: new CloudLlmRuntime(provider, apiKey, model),
+});
+brain.start();
+
+class WebSocketPhoneTransport implements PhoneTransport {
+  constructor(private readonly socket: WebSocket) {}
+
+  isConnected(): boolean {
+    return this.socket.readyState === this.socket.OPEN;
+  }
+
+  send(message: Parameters<PhoneTransport['send']>[0]): void {
+    this.socket.send(JSON.stringify(message));
+  }
+
+  onClose(listener: () => void): void {
+    this.socket.on('close', listener);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.socket.close(code, reason);
+  }
+}
 
 function bearerToken(value: string | undefined): string | null {
   const match = value?.match(/^Bearer\s+(.+)$/i);
@@ -41,8 +69,8 @@ const server = createServer(async (request, response) => {
       ok: true,
       provider,
       model,
-      phoneConnected: manager.hasPhone(),
-      activeTask: manager.getTask()?.id ?? null,
+      phoneConnected: brain.getStatus().phoneConnected,
+      activeTask: brain.getStatus().activeTask?.id ?? null,
     });
     return;
   }
@@ -69,7 +97,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 400, {error: 'instruction must be a non-empty string'});
       return;
     }
-    const taskId = await manager.startTask(body.instruction.trim());
+    const taskId = await brain.submitTask(body.instruction.trim());
     sendJson(response, 202, {taskId, status: 'accepted'});
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -91,14 +119,13 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 webSockets.on('connection', phone => {
-  manager.attachPhone(phone);
+  brain.attachPhone(new WebSocketPhoneTransport(phone));
   phone.send(JSON.stringify({type: 'task_status', status: 'connected'}));
 
   phone.on('message', async raw => {
     try {
       const message = phoneMessageSchema.parse(JSON.parse(raw.toString()));
-      if (message.type === 'screen_state') await manager.onScreenState(message);
-      else await manager.logPassiveEvent(message);
+      await brain.receivePhoneMessage(message);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       phone.send(JSON.stringify({type: 'task_status', status: 'invalid_message', detail}));
