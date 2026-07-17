@@ -52,8 +52,39 @@ function parseJsonObject(text: string): unknown {
     if (start >= 0 && end > start) {
       return JSON.parse(trimmed.slice(start, end + 1));
     }
+    const repaired = repairTruncatedJsonObject(trimmed);
+    if (repaired !== null) return repaired;
     throw new Error('Model response did not contain a JSON object');
   }
+}
+
+function repairTruncatedJsonObject(text: string): unknown | null {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let candidate = text.slice(start).trim();
+  if (!candidate.startsWith('{') || candidate.includes('}')) return null;
+
+  const quoteCount = (candidate.match(/(?<!\\)"/g) ?? []).length;
+  if (quoteCount % 2 === 1) candidate += '"';
+  candidate += '}';
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function isIncompleteJsonResponse(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith('{') && !trimmed.includes('}');
+}
+
+function incompleteJsonRetryCount(history: HistoryStep[]): number {
+  return history
+    .slice(-3)
+    .filter(step => step.action.action === 'wait' && step.action.status?.includes('incomplete JSON'))
+    .length;
 }
 
 export class AndroidAgent {
@@ -149,6 +180,22 @@ export class AndroidAgent {
       return agentActionSchema.parse(parseJsonObject(text));
     } catch (error) {
       console.error('[agent] parse error — raw response:', text);
+      if (isIncompleteJsonResponse(text)) {
+        if (incompleteJsonRetryCount(history) >= 2) {
+          return {
+            action: 'task_failed',
+            reason: 'The local model repeatedly returned incomplete JSON instead of a valid Jarvis action.',
+            status: 'Local model output stayed incomplete',
+            progress: 100,
+          };
+        }
+        return {
+          action: 'wait',
+          ms: 750,
+          status: 'Local model returned incomplete JSON; retrying with fresh screen state',
+          progress: Math.min(95, 20 + history.length * 10),
+        };
+      }
       throw error;
     }
   }
