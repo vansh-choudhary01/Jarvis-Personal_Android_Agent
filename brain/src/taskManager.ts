@@ -1,7 +1,11 @@
 import {AndroidAgent, type HistoryStep} from './agent.js';
+import type {CapabilityManager} from './capabilityManager.js';
+import type {EventBus, JarvisEventPriority, JarvisEventType} from './eventBus.js';
 import {logEvent} from './logger.js';
 import type {AgentAction, BrainMessage, ScreenState} from './protocol.js';
 import type {PhoneTransport} from './phoneTransport.js';
+
+export type TaskState = 'queued' | 'running' | 'waiting' | 'paused' | 'blocked' | 'completed' | 'failed' | 'cancelled';
 
 interface ActiveTask {
   id: string;
@@ -10,6 +14,8 @@ interface ActiveTask {
   processing: boolean;
   startedAt: string;
   actionCount: number;
+  state: TaskState;
+  waitingFor?: string;
 }
 
 export class TaskManager {
@@ -17,7 +23,13 @@ export class TaskManager {
   private task: ActiveTask | null = null;
   private recentPhoneEvents: Record<string, unknown>[] = [];
 
-  constructor(private readonly agent: AndroidAgent) {}
+  constructor(
+    private readonly agent: AndroidAgent,
+    private readonly options: {
+      eventBus?: EventBus;
+      capabilityManager?: CapabilityManager;
+    } = {},
+  ) {}
 
   attachPhone(phone: PhoneTransport): void {
     if (this.phone && this.phone !== phone) {
@@ -49,9 +61,12 @@ export class TaskManager {
       processing: false,
       startedAt: new Date().toISOString(),
       actionCount: 0,
+      state: 'queued',
     };
     await logEvent({kind: 'task_started', taskId: id, instruction});
+    this.publish('task.started', 'brain.task_manager', {taskId: id, instruction, state: 'queued'}, 'high', id);
     this.send({type: 'task_status', status: 'started', detail: instruction});
+    this.setTaskState('waiting', 'screen_state');
     this.send({type: 'request_screen_state'});
     return id;
   }
@@ -62,6 +77,7 @@ export class TaskManager {
 
     const awaitingResult = task.history.at(-1)?.result === null;
     if (awaitingResult && !screen.lastActionResult) return;
+    this.setTaskState('running');
 
     if (task.history.length > 0 && screen.lastActionResult) {
       task.history[task.history.length - 1]!.result = screen.lastActionResult;
@@ -71,10 +87,21 @@ export class TaskManager {
         result: screen.lastActionResult,
         packageName: screen.packageName,
       });
+      this.publish('executor.action_result', 'brain.executor', {
+        taskId: task.id,
+        result: screen.lastActionResult,
+        packageName: screen.packageName,
+      }, 'normal', task.id);
     }
 
     task.processing = true;
     try {
+      this.publish('planner.requested', 'brain.task_manager', {
+        taskId: task.id,
+        instruction: task.instruction,
+        packageName: screen.packageName,
+        historyLength: task.history.length,
+      }, 'normal', task.id);
       const action = await this.agent.nextAction(
         task.instruction,
         screen,
@@ -122,17 +149,71 @@ export class TaskManager {
   }
 
   private async dispatchAction(taskId: string, action: AgentAction): Promise<void> {
+    const capability = this.options.capabilityManager?.checkAction(action);
+    this.publish('planner.action_selected', 'brain.planner', {taskId, action}, 'normal', taskId);
+    if (capability) {
+      this.publish('capability.check', 'brain.capability_manager', {
+        taskId,
+        action: action.action,
+        available: capability.available,
+        required: capability.required,
+        reason: capability.reason,
+      }, capability.available ? 'low' : 'high', taskId);
+    }
+    if (capability && !capability.available) {
+      const reason = capability.reason ?? 'Missing required capability';
+      this.setTaskState('blocked', reason);
+      await logEvent({kind: 'capability_blocked', taskId, action, reason, required: capability.required});
+      this.publish('capability.unavailable', 'brain.capability_manager', {
+        taskId,
+        action: action.action,
+        reason,
+        required: capability.required,
+      }, 'high', taskId);
+      this.send({type: 'task_status', status: 'blocked', detail: reason});
+      return;
+    }
+
     await logEvent({kind: 'action', taskId, action});
+    this.publish('executor.action_started', 'brain.executor', {taskId, action}, 'normal', taskId);
     this.send({type: 'action', ...action});
 
     if (action.action === 'task_complete' || action.action === 'task_failed') {
       await logEvent({kind: 'task_finished', taskId, outcome: action});
+      const state = action.action === 'task_complete' ? 'completed' : 'failed';
+      this.publish(state === 'completed' ? 'task.completed' : 'task.failed', 'brain.task_manager', {
+        taskId,
+        outcome: action,
+        state,
+      }, 'high', taskId);
       this.task = null;
       return;
     }
 
     this.task?.history.push({action, result: null});
     if (this.task && this.task.history.length > 10) this.task.history.shift();
+    this.setTaskState('waiting', 'action_result');
+  }
+
+  private setTaskState(state: TaskState, waitingFor?: string): void {
+    if (!this.task) return;
+    this.task.state = state;
+    this.task.waitingFor = waitingFor;
+    this.publish('task.status', 'brain.task_manager', {
+      taskId: this.task.id,
+      state,
+      waitingFor: waitingFor ?? null,
+    }, state === 'blocked' ? 'high' : 'low', this.task.id);
+  }
+
+  private publish(
+    type: JarvisEventType,
+    source: string,
+    payload: Record<string, unknown>,
+    priority: JarvisEventPriority = 'normal',
+    correlationId?: string,
+  ): void {
+    this.options.eventBus?.publish({type, source, payload, priority, correlationId});
   }
 
   private send(message: BrainMessage): void {

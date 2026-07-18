@@ -25,6 +25,42 @@ Jarvis APK
 
 Important boundary: Planner, Agents, Task Manager, Protocol, and future Memory stay in TypeScript. Kotlin stays a thin platform layer. The Brain calls one runtime interface; it does not know whether the model is MediaPipe, cloud, or a future runtime.
 
+## Phase 3 direction: Android Personal AI Operating Layer
+
+Jarvis is being refactored from command-only automation toward an event-driven Android AI operating layer:
+
+```text
+Android callbacks
+↓
+Kotlin capability layer
+↓
+React Native / native bridge
+↓
+TypeScript Event Bus
+↓
+Rule Engine
+↓
+Working Memory / future Long-Term Memory
+↓
+Planner + Task Manager
+↓
+Executor
+↓
+Android capability layer
+```
+
+The planner should not receive raw Android callbacks. Android signals are normalized into events first. The TypeScript Brain now has these foundation modules:
+
+- `brain/src/eventBus.ts` — centralized event bus and Android phone-message normalization.
+- `brain/src/ruleEngine.ts` — lightweight filtering before waking planner work.
+- `brain/src/workingMemory.ts` — transient current-task/current-screen/recent-event state.
+- `brain/src/eventHistory.ts` — chronological searchable event log foundation.
+- `brain/src/capabilityManager.ts` — maps planner actions to Android capabilities and future permission requests.
+
+Current implementation is intentionally incremental. Existing typed/developer tasks still work through the current `TaskManager`, but task submission, phone messages, planner requests, selected actions, capability checks, executor starts/results, and task completion/failure now publish Brain events.
+
+Future sources such as wake word, calendar, Bluetooth, Wi-Fi, clipboard, package changes, scheduled automations, and plugins should publish events without modifying planner logic. Voice is only one event source: wake word should publish a wake event, speech recognition should publish an instruction event, and the planner should treat spoken tasks the same as typed developer tasks.
+
 ## What works now
 
 - Run the Brain locally inside the Android app.
@@ -39,6 +75,8 @@ Important boundary: Planner, Agents, Task Manager, Protocol, and future Memory s
 - Import `.task` / `.litertlm` models through Android's document picker.
 - Load and test local models through the MediaPipe runtime bridge.
 - Run an offline local-model test from the app.
+- Normalize Brain-side phone/task/action signals through the TypeScript Event Bus.
+- Record rule-engine decisions and working-memory state inside the Brain runtime.
 
 Jarvis cannot unlock the phone, enter a PIN, approve biometrics, read `FLAG_SECURE` screens, or reliably control apps that expose no useful Accessibility nodes.
 
@@ -303,6 +341,12 @@ Useful endpoints in that dev adapter:
 Normal Android operation should use the embedded Brain through `mobile/src/JarvisController.ts`, not the laptop server.
 
 ## Implementation map
+
+- `brain/src/eventBus.ts` — normalized Brain event bus and phone-message event conversion.
+- `brain/src/ruleEngine.ts` — modular pre-planner filtering for noisy/duplicate events.
+- `brain/src/workingMemory.ts` — transient current task, current screen, foreground app, and recent events.
+- `brain/src/eventHistory.ts` — chronological event history foundation for summaries/retrieval.
+- `brain/src/capabilityManager.ts` — action-to-capability abstraction for future permission negotiation/resume.
 
 - `brain/src/runtime.ts` — portable `BrainRuntime` boundary.
 - `brain/src/agent.ts` — planner/agent action loop using the LLM runtime abstraction.
