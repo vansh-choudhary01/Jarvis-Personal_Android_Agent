@@ -5,6 +5,7 @@ export type CapabilityId =
   | 'tap_screen'
   | 'type_text'
   | 'open_app'
+  | 'resolve_app'
   | 'read_notifications'
   | 'read_calls'
   | 'read_sms'
@@ -32,6 +33,7 @@ const ACTION_CAPABILITIES: Partial<Record<AgentAction['action'], CapabilityId[]>
   find_and_tap: ['read_screen', 'tap_screen'],
   swipe: ['tap_screen'],
   open_app: ['open_app'],
+  resolve_app: ['resolve_app'],
   list_apps: ['open_app'],
   get_device_profile: [],
   get_recent_calls: ['read_calls'],
@@ -60,6 +62,10 @@ const REQUIREMENTS: Record<CapabilityId, CapabilityRequirement> = {
   open_app: {
     id: 'open_app',
     userFacingName: 'Open installed apps',
+  },
+  resolve_app: {
+    id: 'resolve_app',
+    userFacingName: 'Resolve installed app names',
   },
   read_notifications: {
     id: 'read_notifications',

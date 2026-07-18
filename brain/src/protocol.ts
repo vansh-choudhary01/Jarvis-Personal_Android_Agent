@@ -59,6 +59,7 @@ const swipe = z.object({
   ...progressFields,
 });
 const openApp = z.object({action: z.literal('open_app'), packageName: z.string(), ...progressFields});
+const resolveApp = z.object({action: z.literal('resolve_app'), appName: z.string(), ...progressFields});
 const listApps = z.object({action: z.literal('list_apps'), ...progressFields});
 const getDeviceProfile = z.object({action: z.literal('get_device_profile'), ...progressFields});
 const call = z.object({action: z.literal('call'), number: z.string(), ...progressFields});
@@ -73,6 +74,7 @@ export const agentActionSchema = z.discriminatedUnion('action', [
   findAndTap,
   swipe,
   openApp,
+  resolveApp,
   listApps,
   getDeviceProfile,
   call,

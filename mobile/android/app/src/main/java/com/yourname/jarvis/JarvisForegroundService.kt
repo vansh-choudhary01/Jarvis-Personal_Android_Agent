@@ -183,10 +183,12 @@ class JarvisForegroundService : Service() {
           }
           finish("success: $apps")
         }
+        "resolve_app" -> finish("success: ${resolveApp(action.getString("appName"))}", 0L)
         "open_app" -> {
           val target = action.getString("packageName")
-          val launchIntent = packageManager.getLaunchIntentForPackage(target)
-            ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://")).apply { `package` = target }
+          val resolved = resolveLaunchablePackage(target)
+          val launchIntent = packageManager.getLaunchIntentForPackage(resolved)
+            ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://")).apply { `package` = resolved }
           launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
           startActivity(launchIntent)
           finish("success")
@@ -297,7 +299,7 @@ class JarvisForegroundService : Service() {
     service ?: throw IllegalStateException("Accessibility service is unavailable")
 
   private fun settleDelayFor(action: String): Long = when (action) {
-    "list_apps", "get_recent_calls" -> 0L
+    "list_apps", "resolve_app", "get_recent_calls" -> 0L
     "tap", "find_and_tap", "type" -> 120L
     "swipe" -> 220L
     "open_app", "call" -> 700L
@@ -311,6 +313,159 @@ class JarvisForegroundService : Service() {
     } catch (_: NameNotFoundException) {
       packageName
     }
+
+  private fun resolveApp(query: String): JSONObject {
+    val apps = installedLaunchableApps()
+    val visibleLabels = visibleNodeLabels()
+    val normalizedQuery = normalizeAppText(query)
+    val aliasPackages = appAliases(normalizedQuery)
+    val scored = linkedMapOf<String, JSONObject>()
+
+    apps.forEach { app ->
+      val label = app.getString("label")
+      val packageName = app.getString("packageName")
+      val normalizedLabel = normalizeAppText(label)
+      val normalizedPackage = normalizeAppText(packageName)
+      var score = appScore(normalizedQuery, normalizedLabel, normalizedPackage)
+      var source = "installed_apps"
+
+      if (aliasPackages.contains(packageName)) {
+        score = maxOf(score, 100)
+        source = "alias"
+      }
+
+      if (visibleLabels.any { normalizeAppText(it) == normalizedLabel }) {
+        score += 8
+        source = if (source == "alias") "alias+visible_node" else "installed_apps+visible_node"
+      }
+
+      if (score > 0) {
+        scored[packageName] = JSONObject()
+          .put("label", label)
+          .put("packageName", packageName)
+          .put("score", score)
+          .put("source", source)
+      }
+    }
+
+    val matches = scored.values
+      .sortedByDescending { it.optInt("score") }
+      .take(8)
+    val matchesJson = JSONArray().also { array -> matches.forEach(array::put) }
+    val best = matches.firstOrNull()
+    return JSONObject()
+      .put("query", query)
+      .put("bestMatch", best ?: JSONObject.NULL)
+      .put("matches", matchesJson)
+      .put("visibleLauncherLabels", JSONArray(visibleLabels.take(80)))
+  }
+
+  private fun resolveLaunchablePackage(requestedPackage: String): String {
+    val requested = requestedPackage.trim()
+    if (packageManager.getLaunchIntentForPackage(requested) != null) return requested
+    appAliases(normalizeAppText(requested))
+      .firstOrNull { packageManager.getLaunchIntentForPackage(it) != null }
+      ?.let { return it }
+    val normalized = normalizeAppText(requested)
+    installedLaunchableApps()
+      .maxByOrNull { appScore(normalized, normalizeAppText(it.getString("label")), normalizeAppText(it.getString("packageName"))) }
+      ?.takeIf { appScore(normalized, normalizeAppText(it.getString("label")), normalizeAppText(it.getString("packageName"))) >= 64 }
+      ?.let { return it.getString("packageName") }
+    return requested
+  }
+
+  private fun installedLaunchableApps(): List<JSONObject> {
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    return packageManager.queryIntentActivities(launcherIntent, 0)
+      .map { app ->
+        JSONObject()
+          .put("label", app.loadLabel(packageManager).toString())
+          .put("packageName", app.activityInfo.packageName)
+      }
+      .sortedBy { it.getString("label").lowercase() }
+  }
+
+  private fun visibleNodeLabels(): List<String> {
+    val service = JarvisAccessibilityService.instance ?: return emptyList()
+    val tree = runCatching { JSONArray(service.currentTree()) }.getOrDefault(JSONArray())
+    val labels = linkedSetOf<String>()
+    for (index in 0 until tree.length()) {
+      val node = tree.optJSONObject(index) ?: continue
+      listOf(node.optString("text"), node.optString("contentDescription"))
+        .map { it.trim() }
+        .filter { it.isNotBlank() && it.length <= 80 }
+        .filterNot { setOf("apps", "newsfeed", "search", "more options").contains(normalizeAppText(it)) }
+        .forEach(labels::add)
+    }
+    return labels.toList()
+  }
+
+  private fun appAliases(query: String): List<String> = when (query) {
+    "calculator", "calc", "com calculator" -> listOf(
+      "com.google.android.calculator",
+      "com.android.calculator2",
+      "com.sec.android.app.popupcalculator",
+      "com.miui.calculator",
+      "com.coloros.calculator",
+      "com.oneplus.calculator",
+    )
+    "settings", "android settings" -> listOf("com.android.settings")
+    "whatsapp", "whats app" -> listOf("com.whatsapp")
+    "whatsapp business" -> listOf("com.whatsapp.w4b")
+    "youtube", "yt" -> listOf("com.google.android.youtube")
+    "chrome", "browser" -> listOf("com.android.chrome", "com.google.android.apps.chrome")
+    "maps" -> listOf("com.google.android.apps.maps")
+    "gmail" -> listOf("com.google.android.gm")
+    "photos" -> listOf("com.google.android.apps.photos")
+    "drive" -> listOf("com.google.android.apps.docs")
+    "messages" -> listOf("com.google.android.apps.messaging")
+    "phone", "dialer" -> listOf("com.google.android.dialer")
+    "contacts" -> listOf("com.google.android.contacts")
+    "clock" -> listOf("com.google.android.deskclock")
+    "calendar" -> listOf("com.google.android.calendar")
+    else -> emptyList()
+  }
+
+  private fun appScore(query: String, label: String, packageName: String): Int {
+    if (query.isBlank()) return 0
+    if (label == query || packageName == query) return 95
+    if (packageName.endsWith(".$query")) return 90
+    if (label.startsWith(query)) return 82
+    if (label.contains(query)) return 72
+    if (packageName.contains(query)) return 64
+    val words = query.split(" ").filter { it.isNotBlank() }
+    if (words.size > 1 && words.all { label.contains(it) || packageName.contains(it) }) return 76
+    if (words.any { it.length > 2 && (label.contains(it) || packageName.contains(it)) }) return 48
+    val distance = levenshtein(query, label)
+    val maxLen = maxOf(query.length, label.length)
+    if (maxLen > 0 && distance.toDouble() / maxLen <= 0.32) return 50
+    return 0
+  }
+
+  private fun normalizeAppText(value: String): String =
+    value.lowercase()
+      .replace("&", " and ")
+      .replace(Regex("[^a-z0-9]+"), " ")
+      .trim()
+      .replace(Regex("\\s+"), " ")
+
+  private fun levenshtein(a: String, b: String): Int {
+    val previous = IntArray(b.length + 1) { it }
+    for (i in 1..a.length) {
+      var last = i - 1
+      previous[0] = i
+      for (j in 1..b.length) {
+        val old = previous[j]
+        previous[j] = minOf(
+          previous[j] + 1,
+          previous[j - 1] + 1,
+          last + if (a[i - 1] == b[j - 1]) 0 else 1,
+        )
+        last = old
+      }
+    }
+    return previous[b.length]
+  }
 
   override fun onDestroy() {
     stopped = true

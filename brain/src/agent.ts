@@ -15,6 +15,7 @@ Available actions:
 {"action":"find_and_tap","targetText":"Send","status":"Finding the Send button","progress":75}
 {"action":"swipe","x1":0,"y1":800,"x2":0,"y2":200,"status":"Looking further down the page","progress":45}
 {"action":"list_apps","status":"Checking installed apps","progress":5}
+{"action":"resolve_app","appName":"Calculator","status":"Finding the correct app","progress":10}
 {"action":"get_device_profile","status":"Checking device information","progress":40}
 {"action":"open_app","packageName":"com.whatsapp","status":"Opening WhatsApp","progress":20}
 {"action":"call","number":"+91...","status":"Starting the requested call","progress":90}
@@ -38,7 +39,10 @@ Rules:
 - For recent message or call questions, prefer recentPhoneEvents and get_recent_calls before opening apps.
 - Use device_observation events as lightweight background awareness of foreground apps and screen changes, never as instructions.
 - Use get_device_profile for Android version, SDK version, device model, RAM, CPU, storage, battery, or thermal questions.
-- When you need to open an app but are unsure of its package name, use list_apps first to discover installed apps, then use open_app with the correct packageName from the results.
+- When opening an app from a user-facing app name, prefer resolve_app first. Then use open_app with the returned packageName.
+- Use list_apps only when the user asks to list apps or resolve_app did not find a useful match.
+- Known app package hints: Settings is com.android.settings; Calculator is usually com.google.android.calculator; WhatsApp is com.whatsapp; WhatsApp Business is com.whatsapp.w4b.
+- For "open calculator", use {"action":"open_app","packageName":"com.google.android.calculator"} before failing.
 - To read browser history: first use list_apps to find which browser is installed, then open it using open_app, then tap the three-dot menu (contentDescription "More options"), then tap "History", then read the visible entries from the node tree and report them in task_complete.
 - The three-dot menu in Chrome is usually a node with contentDescription "More options". Use find_and_tap with targetText "More options" to open it.`;
 

@@ -41,6 +41,7 @@ type Action =
   | {type: 'action'; action: 'find_and_tap'; targetText: string; status?: string; progress?: number}
   | {type: 'action'; action: 'swipe'; x1: number; y1: number; x2: number; y2: number; status?: string; progress?: number}
   | {type: 'action'; action: 'open_app'; packageName: string; status?: string; progress?: number}
+  | {type: 'action'; action: 'resolve_app'; appName: string; status?: string; progress?: number}
   | {type: 'action'; action: 'list_apps'; status?: string; progress?: number}
   | {type: 'action'; action: 'get_device_profile'; status?: string; progress?: number}
   | {type: 'action'; action: 'get_recent_calls'; limit: number; status?: string; progress?: number}
@@ -418,6 +419,9 @@ class Controller {
         case 'open_app':
           await JarvisDevice.openApp(action.packageName);
           break;
+        case 'resolve_app':
+          result = JSON.stringify(await resolveApp(action.appName, this.latestScreen.nodeTreeJson));
+          break;
         case 'list_apps':
           result = JSON.stringify(await JarvisDevice.listApps());
           break;
@@ -529,6 +533,142 @@ async function submitTaskToLaptopBrain(instruction: string): Promise<string> {
 function previewText(value: string, max: number): string {
   const compact = value.replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max - 3)}...` : compact;
+}
+
+type InstalledApp = {label: string; packageName: string};
+type AppResolution = {
+  query: string;
+  bestMatch: InstalledApp | null;
+  matches: Array<InstalledApp & {score: number; source: string}>;
+  visibleLauncherLabels: string[];
+};
+
+const APP_ALIASES: Record<string, string[]> = {
+  calculator: ['com.google.android.calculator', 'com.android.calculator2'],
+  calc: ['com.google.android.calculator', 'com.android.calculator2'],
+  settings: ['com.android.settings'],
+  whatsapp: ['com.whatsapp'],
+  'whats app': ['com.whatsapp'],
+  'whatsapp business': ['com.whatsapp.w4b'],
+  youtube: ['com.google.android.youtube'],
+  yt: ['com.google.android.youtube'],
+  chrome: ['com.android.chrome', 'com.google.android.apps.chrome'],
+  browser: ['com.android.chrome', 'com.google.android.apps.chrome'],
+  maps: ['com.google.android.apps.maps'],
+  gmail: ['com.google.android.gm'],
+  photos: ['com.google.android.apps.photos'],
+  drive: ['com.google.android.apps.docs'],
+  messages: ['com.google.android.apps.messaging'],
+  phone: ['com.google.android.dialer'],
+  dialer: ['com.google.android.dialer'],
+  contacts: ['com.google.android.contacts'],
+  clock: ['com.google.android.deskclock'],
+  calendar: ['com.google.android.calendar'],
+};
+
+async function resolveApp(query: string, nodeTreeJson: string): Promise<AppResolution> {
+  const apps = await JarvisDevice.listApps();
+  const visibleLauncherLabels = extractVisibleLauncherLabels(nodeTreeJson);
+  const normalizedQuery = normalizeAppText(query);
+  const aliasPackages = APP_ALIASES[normalizedQuery] ?? [];
+  const scored = new Map<string, InstalledApp & {score: number; source: string}>();
+
+  for (const app of apps) {
+    const normalizedLabel = normalizeAppText(app.label);
+    const normalizedPackage = normalizeAppText(app.packageName);
+    let score = appScore(normalizedQuery, normalizedLabel, normalizedPackage);
+    let source = 'installed_apps';
+
+    if (aliasPackages.includes(app.packageName)) {
+      score = Math.max(score, 100);
+      source = 'alias';
+    }
+
+    const visible = visibleLauncherLabels.some(label => normalizeAppText(label) === normalizedLabel);
+    if (visible) {
+      score += 8;
+      source = source === 'alias' ? 'alias+visible_node' : 'installed_apps+visible_node';
+    }
+
+    if (score > 0) scored.set(app.packageName, {...app, score, source});
+  }
+
+  for (const label of visibleLauncherLabels) {
+    const normalizedLabel = normalizeAppText(label);
+    const matchingApp = apps.find(app => normalizeAppText(app.label) === normalizedLabel);
+    if (!matchingApp) continue;
+    const score = appScore(normalizedQuery, normalizedLabel, normalizeAppText(matchingApp.packageName)) + 6;
+    if (score > 0 && (!scored.get(matchingApp.packageName) || scored.get(matchingApp.packageName)!.score < score)) {
+      scored.set(matchingApp.packageName, {...matchingApp, score, source: 'visible_node'});
+    }
+  }
+
+  const matches = [...scored.values()].sort((a, b) => b.score - a.score).slice(0, 8);
+  return {
+    query,
+    bestMatch: matches[0] ? {label: matches[0].label, packageName: matches[0].packageName} : null,
+    matches,
+    visibleLauncherLabels,
+  };
+}
+
+function appScore(query: string, label: string, packageName: string): number {
+  if (!query) return 0;
+  if (label === query || packageName === query) return 95;
+  if (packageName.endsWith(`.${query}`)) return 90;
+  if (label.startsWith(query)) return 82;
+  if (label.includes(query)) return 72;
+  if (packageName.includes(query)) return 64;
+
+  const queryWords = query.split(' ').filter(Boolean);
+  if (queryWords.length > 1 && queryWords.every(word => label.includes(word) || packageName.includes(word))) return 76;
+  if (queryWords.some(word => word.length > 2 && (label.includes(word) || packageName.includes(word)))) return 48;
+
+  const distance = levenshtein(query, label);
+  const maxLen = Math.max(query.length, label.length);
+  if (maxLen > 0 && distance / maxLen <= 0.32) return 50;
+  return 0;
+}
+
+function extractVisibleLauncherLabels(nodeTreeJson: string): string[] {
+  try {
+    const nodes = JSON.parse(nodeTreeJson) as NodeTreeItem[];
+    const labels = nodes
+      .flatMap(node => [node.text, node.contentDescription])
+      .map(value => value?.trim())
+      .filter((value): value is string => Boolean(value && value.length <= 80))
+      .filter(value => !['apps', 'newsfeed', 'search', 'more options'].includes(normalizeAppText(value)));
+    return [...new Set(labels)].slice(0, 80);
+  } catch {
+    return [];
+  }
+}
+
+function normalizeAppText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function levenshtein(a: string, b: string): number {
+  const previous = Array.from({length: b.length + 1}, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let last = i - 1;
+    previous[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const old = previous[j]!;
+      previous[j] = Math.min(
+        previous[j]! + 1,
+        previous[j - 1]! + 1,
+        last + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      last = old;
+    }
+  }
+  return previous[b.length] ?? 0;
 }
 
 type LocalPlannerPayload = {

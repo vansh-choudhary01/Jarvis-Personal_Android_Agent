@@ -43,11 +43,14 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
   }
 
   @ReactMethod fun openApp(packageName: String, promise: Promise) {
-    val intent = context.packageManager.getLaunchIntentForPackage(packageName)
-    if (intent == null) return promise.reject("APP_NOT_FOUND", "No launchable app for $packageName")
-    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    context.startActivity(intent)
-    promise.resolve(true)
+    runCatching {
+      val resolved = resolveLaunchablePackage(packageName)
+      val intent = context.packageManager.getLaunchIntentForPackage(resolved)
+        ?: throw IllegalArgumentException("No launchable app for $packageName")
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      context.startActivity(intent)
+      promise.resolve(true)
+    }.onFailure { promise.reject("APP_NOT_FOUND", it.message, it) }
   }
 
   @ReactMethod fun listApps(promise: Promise) {
@@ -155,6 +158,43 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
   }
 
   private fun granted(permission: String) = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+  private fun resolveLaunchablePackage(requestedPackage: String): String {
+    val requested = requestedPackage.trim()
+    if (context.packageManager.getLaunchIntentForPackage(requested) != null) return requested
+
+    val aliases = when (requested.lowercase()) {
+      "calculator", "calc", "com.calculator" -> listOf(
+        "com.google.android.calculator",
+        "com.android.calculator2",
+        "com.sec.android.app.popupcalculator",
+        "com.miui.calculator",
+        "com.coloros.calculator",
+        "com.oneplus.calculator",
+      )
+      "settings", "android settings" -> listOf("com.android.settings")
+      "chrome", "browser" -> listOf("com.android.chrome", "com.google.android.apps.chrome")
+      "whatsapp", "whats app" -> listOf("com.whatsapp")
+      "whatsapp business" -> listOf("com.whatsapp.w4b")
+      else -> emptyList()
+    }
+
+    aliases.firstOrNull { context.packageManager.getLaunchIntentForPackage(it) != null }?.let { return it }
+
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val requestedWords = requested.lowercase().split(Regex("[^a-z0-9]+")).filter { it.isNotBlank() }
+    if (requestedWords.isNotEmpty()) {
+      context.packageManager.queryIntentActivities(launcherIntent, 0)
+        .firstOrNull { app ->
+          val label = app.loadLabel(context.packageManager).toString().lowercase()
+          val pkg = app.activityInfo.packageName.lowercase()
+          requestedWords.all { word -> label.contains(word) || pkg.contains(word) }
+        }
+        ?.let { return it.activityInfo.packageName }
+    }
+
+    throw IllegalArgumentException("No launchable app for $requestedPackage")
+  }
 
   private fun batteryStateName(status: Int) = when (status) {
     BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
