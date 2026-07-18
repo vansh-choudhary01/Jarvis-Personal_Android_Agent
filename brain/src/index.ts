@@ -65,12 +65,15 @@ function sendJson(response: import('node:http').ServerResponse, status: number, 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
   if (request.method === 'GET' && url.pathname === '/health') {
+    const status = brain.getStatus();
     sendJson(response, 200, {
       ok: true,
       provider,
       model,
-      phoneConnected: brain.getStatus().phoneConnected,
-      activeTask: brain.getStatus().activeTask?.id ?? null,
+      phoneConnected: status.phoneConnected,
+      activeTask: status.activeTask?.id ?? null,
+      workingMemory: status.workingMemory,
+      recentEvents: status.recentEvents,
     });
     return;
   }

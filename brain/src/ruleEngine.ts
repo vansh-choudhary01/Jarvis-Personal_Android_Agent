@@ -44,7 +44,7 @@ export class RuleEngine {
     const previousAt = this.recentSignatures.get(signature) ?? 0;
     this.recentSignatures.set(signature, event.timestamp);
     this.pruneSignatures(event.timestamp);
-    if (event.timestamp - previousAt < 30_000) {
+    if (previousAt > 0 && event.timestamp - previousAt < 30_000) {
       return suppress(event, 'duplicate notification within 30s');
     }
     return null;
@@ -80,7 +80,7 @@ export class RuleEngine {
     const signature = `screen_activity:${String(payload.packageName)}:${String(payload.eventType)}`;
     const previousAt = this.recentSignatures.get(signature) ?? 0;
     this.recentSignatures.set(signature, event.timestamp);
-    if (event.timestamp - previousAt < 2_000) {
+    if (previousAt > 0 && event.timestamp - previousAt < 2_000) {
       return suppress(event, 'screen activity repeated within 2s');
     }
     return null;

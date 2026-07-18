@@ -58,7 +58,7 @@ export class WorkingMemory {
     }
 
     if (event.type === 'task.completed' || event.type === 'task.failed' || event.type === 'task.cancelled') {
-      this.currentTaskState = event.type.replace('task.', '');
+      this.currentTaskState = 'idle';
       this.currentTaskId = null;
       this.currentTaskInstruction = null;
     }

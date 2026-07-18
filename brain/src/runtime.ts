@@ -40,10 +40,11 @@ export class BrainRuntime {
   private readonly eventHistory = new EventHistory();
   private readonly workingMemory = new WorkingMemory();
   private readonly capabilityManager = new CapabilityManager();
+  private readonly eventDecisions = new Map<string, RuleDecision>();
   private running = false;
 
   constructor(private readonly options: BrainRuntimeOptions) {
-    this.eventBus.subscribe(event => this.workingMemory.observe(event));
+    this.eventBus.subscribe(event => this.routeEvent(event));
     this.manager = new TaskManager(new AndroidAgent(options.llm), {
       eventBus: this.eventBus,
       capabilityManager: this.capabilityManager,
@@ -101,8 +102,19 @@ export class BrainRuntime {
 
   private publishEvent(draft: Parameters<EventBus['publish']>[0]): {event: JarvisEvent; decision: RuleDecision} {
     const event = this.eventBus.publish(draft);
+    const decision = this.eventDecisions.get(event.id) ?? this.defaultDecision(event);
+    return {event, decision};
+  }
+
+  private routeEvent(event: JarvisEvent): void {
     const decision = this.ruleEngine.decide(event);
+    this.eventDecisions.set(event.id, decision);
+    if (this.eventDecisions.size > 300) {
+      const first = this.eventDecisions.keys().next().value;
+      if (first) this.eventDecisions.delete(first);
+    }
     this.eventHistory.record(event, decision);
+    this.workingMemory.observe(event);
     logEvent({
       kind: 'event',
       eventType: event.type,
@@ -113,6 +125,16 @@ export class BrainRuntime {
       reason: decision.reason,
       payload: event.payload,
     }).catch(() => undefined);
-    return {event, decision};
+  }
+
+  private defaultDecision(event: JarvisEvent): RuleDecision {
+    return {
+      eventId: event.id,
+      eventType: event.type,
+      action: 'allow',
+      wakePlanner: false,
+      reason: 'event accepted before recorder returned',
+      timestamp: Date.now(),
+    };
   }
 }
