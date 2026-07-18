@@ -31,6 +31,7 @@ class JarvisForegroundService : Service() {
     const val NOTIFICATION_ID = 1407
     const val EXTRA_BRAIN_URL = "brain_url"
     const val EXTRA_AUTH_TOKEN = "auth_token"
+    const val LOCAL_BRAIN_URL = "local://embedded-brain"
     @Volatile var instance: JarvisForegroundService? = null
       private set
   }
@@ -59,10 +60,15 @@ class JarvisForegroundService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val prefs = getSharedPreferences("jarvis", MODE_PRIVATE)
-    brainUrl = intent?.getStringExtra(EXTRA_BRAIN_URL) ?: prefs.getString(EXTRA_BRAIN_URL, "").orEmpty()
-    authToken = intent?.getStringExtra(EXTRA_AUTH_TOKEN) ?: prefs.getString(EXTRA_AUTH_TOKEN, "").orEmpty()
+    val explicitBrainUrl = intent?.getStringExtra(EXTRA_BRAIN_URL)
+    brainUrl = explicitBrainUrl ?: LOCAL_BRAIN_URL
+    authToken = if (explicitBrainUrl == null) "" else intent?.getStringExtra(EXTRA_AUTH_TOKEN) ?: ""
     localMode = brainUrl.startsWith("local://")
-    if (!localMode && brainUrl.isNotBlank() && authToken.isNotBlank()) {
+    if (localMode) {
+      prefs.edit().putString(EXTRA_BRAIN_URL, LOCAL_BRAIN_URL).putString(EXTRA_AUTH_TOKEN, "").apply()
+      brainUrl = LOCAL_BRAIN_URL
+      authToken = ""
+    } else if (brainUrl.isNotBlank() && authToken.isNotBlank()) {
       prefs.edit().putString(EXTRA_BRAIN_URL, brainUrl).putString(EXTRA_AUTH_TOKEN, authToken).apply()
     }
 

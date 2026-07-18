@@ -202,6 +202,59 @@ Open Calculator and calculate 125 multiplied by 8.
 
 WhatsApp history is notification-based. Jarvis can report notifications captured while its notification listener was active; it does not read WhatsApp's private database.
 
+## Switching between embedded local mode and laptop/cloud dev mode
+
+Jarvis has two development run modes:
+
+- Embedded/local mode: the Android app runs the TypeScript Brain through the React Native runtime and calls the on-device local model runtime.
+- Laptop/cloud dev mode: the Android foreground service connects to the Node Brain on `localhost:3000`; the Node Brain chooses Gemini or Anthropic from `brain/.env`.
+
+For embedded/local mode, set `mobile/src/config.ts` to:
+
+```ts
+brainWebSocketUrl: 'local://embedded-brain',
+phoneAuthToken: '',
+```
+
+For Gemini or Anthropic through the laptop Brain, set `mobile/src/config.ts` to:
+
+```ts
+brainWebSocketUrl: 'ws://127.0.0.1:3000/phone',
+phoneAuthToken: 'jarvis-local-emulator-dev-token-2026',
+```
+
+Then start the laptop Brain from `brain`:
+
+```powershell
+cd "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis\brain"
+npm.cmd install
+npm.cmd run build
+npm.cmd start
+```
+
+Configure the provider in `brain/.env`:
+
+```env
+AI_PROVIDER=gemini
+GEMINI_API_KEY=...
+```
+
+or:
+
+```env
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+```
+
+For a USB-connected physical phone, reverse both ports before opening the app:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s ZD222TQVPK reverse tcp:3000 tcp:3000
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s ZD222TQVPK reverse tcp:8081 tcp:8081
+```
+
+Replace `ZD222TQVPK` with your device id. If the app shows `fetch failed` in laptop/cloud dev mode, first check that `GET http://localhost:3000/health` reports the selected provider and `phoneConnected: true`, then restart the Node Brain with network access enabled.
+
 ## Local AI Runtime
 
 Open the `AI Runtime` tab in the app to:

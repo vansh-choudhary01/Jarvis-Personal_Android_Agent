@@ -158,6 +158,54 @@ Tap the `Jarvis` title three times to toggle Developer Mode. The Developer secti
 
 Tasks are submitted directly to the embedded `BrainRuntime`; they do not go through `localhost:3000`.
 
+## Optional Gemini/Anthropic laptop Brain mode
+
+Normal Android development should use embedded local mode:
+
+```ts
+// mobile/src/config.ts
+brainWebSocketUrl: 'local://embedded-brain',
+phoneAuthToken: '',
+```
+
+For testing Gemini or Anthropic while keeping the phone UI/native bridge, switch `mobile/src/config.ts` to the USB-reversed laptop Brain:
+
+```ts
+brainWebSocketUrl: 'ws://127.0.0.1:3000/phone',
+phoneAuthToken: 'jarvis-local-emulator-dev-token-2026',
+```
+
+Start the Node Brain from the project root's `brain` folder:
+
+```powershell
+cd "C:\Users\HP\Documents\Codex\2026-07-11\files-mentioned-by-the-user-build\outputs\jarvis\brain"
+npm.cmd run build
+npm.cmd start
+```
+
+Choose the provider in `brain/.env`:
+
+```env
+AI_PROVIDER=gemini
+GEMINI_API_KEY=...
+```
+
+or:
+
+```env
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+```
+
+For a physical phone over USB:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s ZD222TQVPK reverse tcp:3000 tcp:3000
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s ZD222TQVPK reverse tcp:8081 tcp:8081
+```
+
+Then reopen Jarvis. `http://localhost:3000/health` should show the selected provider and `phoneConnected: true`.
+
 ## AI Runtime screen
 
 The AI Runtime tab includes:

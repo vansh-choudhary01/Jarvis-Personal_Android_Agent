@@ -7,9 +7,19 @@ let sink: LogSink = event => {
 };
 
 export function setLogSink(nextSink: LogSink): void {
-  sink = nextSink;
+  sink = async event => {
+    try {
+      await nextSink(event);
+    } catch (error) {
+      console.warn('[brain] log sink failed:', error instanceof Error ? error.message : String(error));
+    }
+  };
 }
 
 export async function logEvent(event: Record<string, unknown>): Promise<void> {
-  await sink(event);
+  try {
+    await sink(event);
+  } catch (error) {
+    console.warn('[brain] log failed:', error instanceof Error ? error.message : String(error));
+  }
 }

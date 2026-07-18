@@ -20,6 +20,7 @@ import {
   recommendModel,
   type ModelDefinition,
 } from './localAiRuntime';
+import {JARVIS_CONFIG} from './config';
 
 type ConnectionListener = (status: string) => void;
 type ScreenEvent = {nodeTreeJson: string; packageName: string};
@@ -246,9 +247,20 @@ class Controller {
   }
 
   async start(): Promise<void> {
-    if (!this.stopped && this.brain) return;
+    if (!this.stopped && (this.brain || !isEmbeddedBrainMode())) return;
     this.stopped = false;
     this.installNativeListeners();
+    if (!isEmbeddedBrainMode()) {
+      this.transport?.close();
+      this.transport = null;
+      this.brain?.stop();
+      this.brain = null;
+      this.pushLog('native_service_start', `Starting Android foreground service for ${JARVIS_CONFIG.brainWebSocketUrl}`);
+      await JarvisDevice.startForegroundService(JARVIS_CONFIG.brainWebSocketUrl, JARVIS_CONFIG.phoneAuthToken);
+      this.setStatus('Connected to laptop Brain');
+      return;
+    }
+
     setLogSink((event: Record<string, unknown>) => {
       const kind = typeof event.kind === 'string' ? event.kind : 'brain_event';
       this.pushLog(`brain:${kind}`, summarizeBrainEvent(event), event);
@@ -277,7 +289,13 @@ class Controller {
   }
 
   async submitTask(instruction: string): Promise<string> {
-    if (!this.brain || this.stopped) await this.start();
+    if (this.stopped || (!this.brain && isEmbeddedBrainMode())) await this.start();
+    if (!isEmbeddedBrainMode()) {
+      this.pushLog('task_submit_start', instruction);
+      const taskId = await submitTaskToLaptopBrain(instruction);
+      this.pushLog('task_submit_done', `Accepted ${taskId}`, {taskId, instruction, mode: 'laptop'});
+      return taskId;
+    }
     if (!this.brain) throw new Error('Embedded brain did not start.');
     this.pushLog('task_submit_start', instruction);
     const taskId = await this.brain.submitTask(instruction);
@@ -287,6 +305,14 @@ class Controller {
   }
 
   getStatus(): {running: boolean; phoneConnected: boolean; llmProvider: string; llmModel: string} | null {
+    if (!isEmbeddedBrainMode()) {
+      return {
+        running: !this.stopped,
+        phoneConnected: !this.stopped,
+        llmProvider: 'laptop-brain',
+        llmModel: 'Gemini/Anthropic from brain/.env',
+      };
+    }
     return this.brain?.getStatus() ?? null;
   }
 
@@ -472,6 +498,32 @@ function delay(ms: number): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isEmbeddedBrainMode(): boolean {
+  return JARVIS_CONFIG.brainWebSocketUrl.startsWith('local://');
+}
+
+function laptopTaskUrl(): string {
+  return JARVIS_CONFIG.brainWebSocketUrl
+    .replace(/^ws:/, 'http:')
+    .replace(/^wss:/, 'https:')
+    .replace(/\/phone(?:\?.*)?$/, '/task');
+}
+
+async function submitTaskToLaptopBrain(instruction: string): Promise<string> {
+  const response = await fetch(laptopTaskUrl(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${JARVIS_CONFIG.phoneAuthToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({instruction}),
+  });
+  const body = await response.json() as {taskId?: unknown; error?: unknown};
+  if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : `Task request failed with HTTP ${response.status}`);
+  if (typeof body.taskId !== 'string') throw new Error('Brain did not return a task id.');
+  return body.taskId;
 }
 
 function previewText(value: string, max: number): string {

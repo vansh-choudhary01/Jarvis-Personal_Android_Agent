@@ -93,14 +93,20 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
   const [connection, setConnection] = useState('Not started');
   const [screen, setScreen] = useState<'setup' | 'runtime'>('setup');
   const [deviceProfile, setDeviceProfile] = useState<DeviceProfile | null>(null);
+  const [deviceProfileError, setDeviceProfileError] = useState('');
   const started = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
       setPermissions(await JarvisDevice.getPermissionStatus());
-      setDeviceProfile(await JarvisDevice.getDeviceProfile());
     } catch {
       setConnection('Native module unavailable — rebuild the Android app');
+    }
+    try {
+      setDeviceProfile(await JarvisDevice.getDeviceProfile());
+      setDeviceProfileError('');
+    } catch (error) {
+      setDeviceProfileError(error instanceof Error ? error.message : String(error));
     }
   }, []);
 
@@ -159,7 +165,7 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
           <Pressable style={[styles.tabButton, screen === 'setup' && styles.tabButtonActive]} onPress={() => setScreen('setup')}>
             <Text style={[styles.tabText, screen === 'setup' && styles.tabTextActive]}>Setup</Text>
           </Pressable>
-          <Pressable style={[styles.tabButton, screen === 'runtime' && styles.tabButtonActive]} onPress={() => setScreen('runtime')}>
+          <Pressable style={[styles.tabButton, screen === 'runtime' && styles.tabButtonActive]} onPress={() => { setScreen('runtime'); refresh(); }}>
             <Text style={[styles.tabText, screen === 'runtime' && styles.tabTextActive]}>AI Runtime</Text>
           </Pressable>
         </View>
@@ -213,7 +219,7 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
         </Text>
           </>
         ) : (
-          <RuntimeSettingsScreen profile={deviceProfile} devMode={devMode} onRefresh={refresh} />
+          <RuntimeSettingsScreen profile={deviceProfile} profileError={deviceProfileError} devMode={devMode} onRefresh={refresh} />
         )}
 
         {devMode && <DevScreen connection={connection} permissions={permissions} />}
@@ -226,10 +232,12 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
 
 function RuntimeSettingsScreen({
   profile,
+  profileError,
   devMode,
   onRefresh,
 }: {
   profile: DeviceProfile | null;
+  profileError: string;
   devMode: boolean;
   onRefresh: () => void | Promise<void>;
 }): React.JSX.Element {
@@ -422,7 +430,8 @@ function RuntimeSettingsScreen({
     return (
       <View style={runtime.container}>
         <Text style={runtime.heading}>AI Runtime</Text>
-        <Text style={runtime.body}>Device profile is not available yet. Rebuild and reopen the Android app if this stays empty.</Text>
+        <Text style={runtime.body}>Device profile is not available yet. Tap refresh. If it still stays empty after reinstall, the native module did not load correctly.</Text>
+        {!!profileError && <Text style={runtime.errorText}>{profileError}</Text>}
         <Pressable style={runtime.primaryButton} onPress={onRefresh}>
           <Text style={runtime.primaryButtonText}>Refresh Device Profile</Text>
         </Pressable>
