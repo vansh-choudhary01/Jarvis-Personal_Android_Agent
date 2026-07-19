@@ -7,6 +7,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
@@ -86,6 +87,10 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
       putBoolean("callLog", granted(Manifest.permission.READ_CALL_LOG))
       putBoolean("sms", granted(Manifest.permission.READ_SMS) && granted(Manifest.permission.RECEIVE_SMS))
       putBoolean("callPhone", granted(Manifest.permission.CALL_PHONE))
+      putBoolean("phoneState", granted(Manifest.permission.READ_PHONE_STATE))
+      putBoolean("bluetooth", Build.VERSION.SDK_INT < Build.VERSION_CODES.S || granted(Manifest.permission.BLUETOOTH_CONNECT))
+      putBoolean("networkState", granted(Manifest.permission.ACCESS_NETWORK_STATE))
+      putBoolean("clipboard", true)
       putBoolean("postNotifications", Build.VERSION.SDK_INT < 33 || granted(Manifest.permission.POST_NOTIFICATIONS))
     })
   }
@@ -154,7 +159,16 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
   @ReactMethod fun removeListeners(count: Double) = Unit
 
   private fun openSettings(action: String) {
-    context.startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    val exactIntent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val fallbackIntent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+      .setData(Uri.fromParts("package", context.packageName, null))
+      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    runCatching {
+      context.startActivity(exactIntent)
+    }.onFailure {
+      context.startActivity(fallbackIntent)
+    }
   }
 
   private fun granted(permission: String) = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
@@ -162,24 +176,6 @@ class DeviceModule(private val context: ReactApplicationContext) : ReactContextB
   private fun resolveLaunchablePackage(requestedPackage: String): String {
     val requested = requestedPackage.trim()
     if (context.packageManager.getLaunchIntentForPackage(requested) != null) return requested
-
-    val aliases = when (requested.lowercase()) {
-      "calculator", "calc", "com.calculator" -> listOf(
-        "com.google.android.calculator",
-        "com.android.calculator2",
-        "com.sec.android.app.popupcalculator",
-        "com.miui.calculator",
-        "com.coloros.calculator",
-        "com.oneplus.calculator",
-      )
-      "settings", "android settings" -> listOf("com.android.settings")
-      "chrome", "browser" -> listOf("com.android.chrome", "com.google.android.apps.chrome")
-      "whatsapp", "whats app" -> listOf("com.whatsapp")
-      "whatsapp business" -> listOf("com.whatsapp.w4b")
-      else -> emptyList()
-    }
-
-    aliases.firstOrNull { context.packageManager.getLaunchIntentForPackage(it) != null }?.let { return it }
 
     val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     val requestedWords = requested.lowercase().split(Regex("[^a-z0-9]+")).filter { it.isNotBlank() }

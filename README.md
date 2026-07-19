@@ -6,6 +6,8 @@ The laptop Node server is no longer required for normal Android use. It remains 
 
 ## Current architecture
 
+For the detailed event-driven architecture audit, readiness scores, validation matrix, and known debt, see [docs/ARCHITECTURE_VALIDATION.md](docs/ARCHITECTURE_VALIDATION.md).
+
 ```text
 Jarvis APK
 ├─ React Native UI

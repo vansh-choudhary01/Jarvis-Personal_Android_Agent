@@ -141,8 +141,9 @@ Open Jarvis and complete:
 
 1. Accessibility control
 2. Notification access
-3. Call, SMS, and notification runtime permissions
-4. Battery exemption
+3. Call, SMS, phone-state, calling, and notification runtime permissions
+4. Wireless event router readiness for Bluetooth, WiFi/network, and clipboard observation
+5. Battery exemption
 
 When all rows are ready, Jarvis starts the embedded Brain automatically.
 

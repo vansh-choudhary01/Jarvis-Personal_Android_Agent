@@ -26,6 +26,13 @@ type ConnectionListener = (status: string) => void;
 type ScreenEvent = {nodeTreeJson: string; packageName: string};
 type NotificationEvent = {packageName: string; title: string; text: string; timestamp: number};
 type SmsEvent = {sender: string; body: string; timestamp: number};
+type AndroidEvent = {
+  eventType: string;
+  source: string;
+  priority: 'low' | 'normal' | 'high' | 'critical';
+  timestamp: number;
+  payload: Record<string, unknown>;
+};
 type DeviceObservationEvent = {
   kind: 'app_changed' | 'screen_changed' | 'screen_activity' | 'user_interaction';
   packageName: string;
@@ -337,6 +344,10 @@ class Controller {
       this.pushLog('native_sms', `SMS from ${event.sender}`, {...event, body: previewText(event.body, 160)});
       this.receivePhoneMessage({type: 'sms_received', ...event});
     });
+    events.addListener('android_event', (event: AndroidEvent) => {
+      this.pushLog('native_event', `${event.eventType} from ${event.source}`, event);
+      this.receivePhoneMessage({type: 'android_event', ...event});
+    });
     events.addListener('device_observation', (event: DeviceObservationEvent) => {
       this.pushLog('native_observation', `${event.kind}: ${event.appLabel || event.packageName}`, event);
       this.receivePhoneMessage({
@@ -543,34 +554,10 @@ type AppResolution = {
   visibleLauncherLabels: string[];
 };
 
-const APP_ALIASES: Record<string, string[]> = {
-  calculator: ['com.google.android.calculator', 'com.android.calculator2'],
-  calc: ['com.google.android.calculator', 'com.android.calculator2'],
-  settings: ['com.android.settings'],
-  whatsapp: ['com.whatsapp'],
-  'whats app': ['com.whatsapp'],
-  'whatsapp business': ['com.whatsapp.w4b'],
-  youtube: ['com.google.android.youtube'],
-  yt: ['com.google.android.youtube'],
-  chrome: ['com.android.chrome', 'com.google.android.apps.chrome'],
-  browser: ['com.android.chrome', 'com.google.android.apps.chrome'],
-  maps: ['com.google.android.apps.maps'],
-  gmail: ['com.google.android.gm'],
-  photos: ['com.google.android.apps.photos'],
-  drive: ['com.google.android.apps.docs'],
-  messages: ['com.google.android.apps.messaging'],
-  phone: ['com.google.android.dialer'],
-  dialer: ['com.google.android.dialer'],
-  contacts: ['com.google.android.contacts'],
-  clock: ['com.google.android.deskclock'],
-  calendar: ['com.google.android.calendar'],
-};
-
 async function resolveApp(query: string, nodeTreeJson: string): Promise<AppResolution> {
   const apps = await JarvisDevice.listApps();
   const visibleLauncherLabels = extractVisibleLauncherLabels(nodeTreeJson);
   const normalizedQuery = normalizeAppText(query);
-  const aliasPackages = APP_ALIASES[normalizedQuery] ?? [];
   const scored = new Map<string, InstalledApp & {score: number; source: string}>();
 
   for (const app of apps) {
@@ -579,15 +566,10 @@ async function resolveApp(query: string, nodeTreeJson: string): Promise<AppResol
     let score = appScore(normalizedQuery, normalizedLabel, normalizedPackage);
     let source = 'installed_apps';
 
-    if (aliasPackages.includes(app.packageName)) {
-      score = Math.max(score, 100);
-      source = 'alias';
-    }
-
     const visible = visibleLauncherLabels.some(label => normalizeAppText(label) === normalizedLabel);
     if (visible) {
       score += 8;
-      source = source === 'alias' ? 'alias+visible_node' : 'installed_apps+visible_node';
+      source = 'installed_apps+visible_node';
     }
 
     if (score > 0) scored.set(app.packageName, {...app, score, source});
@@ -673,21 +655,15 @@ function levenshtein(a: string, b: string): number {
 
 type LocalPlannerPayload = {
   originalInstruction?: unknown;
+  plannerContext?: unknown;
   recentHistory?: unknown;
   currentScreenState?: {
     packageName?: unknown;
     nodeTree?: unknown;
+    nodeCount?: unknown;
     lastActionResult?: unknown;
   };
   recentPhoneEvents?: unknown;
-};
-
-type CompactNode = {
-  text?: string;
-  desc?: string;
-  cls?: string;
-  clickable?: boolean;
-  editable?: boolean;
 };
 
 function buildLocalPlannerPrompt(request: {system: string; prompt: string}): string {
@@ -701,9 +677,9 @@ function buildLocalPlannerPrompt(request: {system: string; prompt: string}): str
   }
 
   const screen = payload.currentScreenState ?? {};
-  const nodes = compactNodes(screen.nodeTree);
   const history = compactJson(payload.recentHistory, 360);
   const events = compactJson(payload.recentPhoneEvents, 360);
+  const plannerContext = compactJson(payload.plannerContext, 1200);
   const packageName = safeText(screen.packageName, 90) || 'unknown';
   const lastActionResult = safeText(screen.lastActionResult, 220) || 'none';
   const instruction = safeText(payload.originalInstruction, 500);
@@ -719,9 +695,9 @@ function buildLocalPlannerPrompt(request: {system: string; prompt: string}): str
     'Prefer find_and_tap using visible text. Avoid coordinates unless absolutely necessary.',
     '',
     `User task: ${instruction}`,
+    `Planner context: ${plannerContext}`,
     `Current package: ${packageName}`,
     `Last action result: ${lastActionResult}`,
-    `Visible UI text: ${compactVisibleText(nodes) || 'none'}`,
     `Recent history: ${history}`,
     `Recent phone events: ${events}`,
     'JSON only:',
@@ -738,30 +714,6 @@ function parsePlannerPayload(prompt: string): LocalPlannerPayload | null {
   }
 }
 
-function compactNodes(value: unknown): CompactNode[] {
-  const nodes = Array.isArray(value) ? value : [];
-  return nodes
-    .map(node => (node && typeof node === 'object' ? node as Record<string, unknown> : null))
-    .filter((node): node is Record<string, unknown> => !!node)
-    .filter(node => Boolean(safeText(node.text, 80) || safeText(node.contentDescription, 80) || node.clickable || node.editable))
-    .slice(0, 45)
-    .map(node => ({
-      text: safeText(node.text, 70) || undefined,
-      desc: safeText(node.contentDescription, 70) || undefined,
-      cls: shortClassName(safeText(node.className, 80)) || undefined,
-      clickable: Boolean(node.clickable),
-      editable: Boolean(node.editable),
-    }));
-}
-
-function compactVisibleText(nodes: CompactNode[]): string {
-  return nodes
-    .map(node => [node.text, node.desc].filter(Boolean).join(' / '))
-    .filter(Boolean)
-    .slice(0, 25)
-    .join(' | ');
-}
-
 function compactJson(value: unknown, max: number): string {
   try {
     return previewText(JSON.stringify(value ?? []), max);
@@ -773,12 +725,6 @@ function compactJson(value: unknown, max: number): string {
 function safeText(value: unknown, max: number): string {
   if (value == null) return '';
   return previewText(String(value), max);
-}
-
-function shortClassName(value: string): string {
-  if (!value) return '';
-  const parts = value.split('.');
-  return parts[parts.length - 1] ?? value;
 }
 
 function messageType(message: object): string {

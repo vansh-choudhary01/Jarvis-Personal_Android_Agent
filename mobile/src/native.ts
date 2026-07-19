@@ -17,6 +17,10 @@ export interface PermissionStatus {
   callLog: boolean;
   sms: boolean;
   callPhone: boolean;
+  phoneState: boolean;
+  bluetooth: boolean;
+  networkState: boolean;
+  clipboard: boolean;
   postNotifications: boolean;
 }
 

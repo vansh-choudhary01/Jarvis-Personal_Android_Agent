@@ -5,14 +5,24 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.PackageManager.NameNotFoundException
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.CallLog
+import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
@@ -46,6 +56,39 @@ class JarvisForegroundService : Service() {
   private var localMode = false
   private var currentStatus = "Not started"
   private var taskActive = false
+  private var lastBatteryPercent: Int? = null
+  private var lastCharging: Boolean? = null
+  private var lastPhoneState = TelephonyManager.EXTRA_STATE_IDLE
+  private var screenSnapshotQueued = false
+  private var systemReceiverRegistered = false
+  private var packageReceiverRegistered = false
+  private var clipboardListener: ClipboardManager.OnPrimaryClipChangedListener? = null
+
+  private val systemReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+      when (intent.action) {
+        Intent.ACTION_BATTERY_CHANGED -> publishBatteryChanged(intent)
+        Intent.ACTION_BATTERY_LOW -> publishAndroidEvent("battery.low", "android.battery", "high", mapOf("percent" to (lastBatteryPercent ?: -1)))
+        Intent.ACTION_POWER_CONNECTED -> publishAndroidEvent("charging.started", "android.power", "normal", batteryPayload(intent, true))
+        Intent.ACTION_POWER_DISCONNECTED -> publishAndroidEvent("charging.stopped", "android.power", "normal", batteryPayload(intent, false))
+        Intent.ACTION_SCREEN_OFF -> publishAndroidEvent("screen.locked", "android.screen", "high", mapOf("interactive" to false))
+        Intent.ACTION_SCREEN_ON -> publishAndroidEvent("screen.unlocked", "android.screen", "normal", mapOf("interactive" to true, "reason" to "screen_on"))
+        Intent.ACTION_USER_PRESENT -> publishAndroidEvent("screen.unlocked", "android.screen", "high", mapOf("interactive" to true, "reason" to "user_present"))
+        BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED -> publishBluetoothEvent(intent)
+        ConnectivityManager.CONNECTIVITY_ACTION -> publishWifiEvent()
+        TelephonyManager.ACTION_PHONE_STATE_CHANGED -> publishCallState(intent)
+      }
+    }
+  }
+
+  private val packageReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+      when (intent.action) {
+        Intent.ACTION_PACKAGE_ADDED -> publishPackageEvent("package.installed", intent)
+        Intent.ACTION_PACKAGE_REMOVED -> publishPackageEvent("package.removed", intent)
+      }
+    }
+  }
 
   override fun onCreate() {
     super.onCreate()
@@ -88,6 +131,7 @@ class JarvisForegroundService : Service() {
         .build(),
     )
     stopped = false
+    registerSystemEventPublishers()
     if (localMode) {
       socket?.close(1000, "Switching to embedded brain")
       socket = null
@@ -241,7 +285,14 @@ class JarvisForegroundService : Service() {
     }
   }
 
-  fun onAccessibilityChanged() = Unit
+  fun onAccessibilityChanged() {
+    if (screenSnapshotQueued) return
+    screenSnapshotQueued = true
+    handler.postDelayed({
+      screenSnapshotQueued = false
+      sendScreenState(null)
+    }, 350L)
+  }
 
   fun sendNotification(packageName: String, title: String, text: String, timestamp: Long) {
     socket?.send(JSONObject()
@@ -306,6 +357,133 @@ class JarvisForegroundService : Service() {
     else -> 120L
   }
 
+  private fun registerSystemEventPublishers() {
+    if (!systemReceiverRegistered) {
+      val filter = IntentFilter().apply {
+        addAction(Intent.ACTION_BATTERY_CHANGED)
+        addAction(Intent.ACTION_BATTERY_LOW)
+        addAction(Intent.ACTION_POWER_CONNECTED)
+        addAction(Intent.ACTION_POWER_DISCONNECTED)
+        addAction(Intent.ACTION_SCREEN_OFF)
+        addAction(Intent.ACTION_SCREEN_ON)
+        addAction(Intent.ACTION_USER_PRESENT)
+      }
+      registerReceiver(systemReceiver, filter)
+
+      registerReceiver(systemReceiver, IntentFilter().apply {
+        addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
+        addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+        addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+      })
+      systemReceiverRegistered = true
+    }
+
+    if (!packageReceiverRegistered) {
+      registerReceiver(packageReceiver, IntentFilter().apply {
+        addAction(Intent.ACTION_PACKAGE_ADDED)
+        addAction(Intent.ACTION_PACKAGE_REMOVED)
+        addDataScheme("package")
+      })
+      packageReceiverRegistered = true
+    }
+
+    if (clipboardListener == null) {
+      val clipboard = getSystemService(ClipboardManager::class.java)
+      clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+        val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+        publishAndroidEvent("clipboard.changed", "android.clipboard", "normal", mapOf("text" to text.take(500)))
+      }.also { clipboard.addPrimaryClipChangedListener(it) }
+    }
+  }
+
+  private fun publishBatteryChanged(intent: Intent) {
+    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+    val percent = if (level >= 0 && scale > 0) level * 100 / scale else -1
+    val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN)
+    val charging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+    if (lastBatteryPercent == percent && lastCharging == charging) return
+    lastBatteryPercent = percent
+    lastCharging = charging
+    publishAndroidEvent("battery.changed", "android.battery", "low", batteryPayload(intent, charging) + mapOf("percent" to percent))
+  }
+
+  private fun batteryPayload(intent: Intent, charging: Boolean): Map<String, Any?> {
+    val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+    val source = when (plugged) {
+      BatteryManager.BATTERY_PLUGGED_USB -> "usb"
+      BatteryManager.BATTERY_PLUGGED_AC -> "ac"
+      BatteryManager.BATTERY_PLUGGED_WIRELESS -> "wireless"
+      else -> ""
+    }
+    return mapOf("charging" to charging, "powerSource" to source)
+  }
+
+  private fun publishPackageEvent(eventType: String, intent: Intent) {
+    val packageName = intent.data?.schemeSpecificPart.orEmpty()
+    if (packageName.isBlank() || packageName == this.packageName) return
+    publishAndroidEvent(eventType, "android.package_manager", "normal", mapOf("packageName" to packageName, "replacing" to intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)))
+  }
+
+  private fun publishBluetoothEvent(intent: Intent) {
+    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_CONNECTION_STATE, BluetoothAdapter.STATE_DISCONNECTED)
+    val eventType = if (state == BluetoothAdapter.STATE_CONNECTED) "bluetooth.connected" else if (state == BluetoothAdapter.STATE_DISCONNECTED) "bluetooth.disconnected" else return
+    publishAndroidEvent(eventType, "android.bluetooth", "normal", mapOf("state" to state))
+  }
+
+  private fun publishWifiEvent() {
+    val connectivity = getSystemService(ConnectivityManager::class.java)
+    val network = connectivity.activeNetwork
+    val capabilities = connectivity.getNetworkCapabilities(network)
+    val connected = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    publishAndroidEvent(if (connected) "wifi.connected" else "wifi.lost", "android.connectivity", "normal", mapOf("connected" to connected))
+  }
+
+  private fun publishCallState(intent: Intent) {
+    val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE).orEmpty()
+    if (state == lastPhoneState) return
+    lastPhoneState = state
+    val eventType = when (state) {
+      TelephonyManager.EXTRA_STATE_RINGING -> "call.incoming"
+      TelephonyManager.EXTRA_STATE_IDLE -> "call.ended"
+      else -> return
+    }
+    publishAndroidEvent(eventType, "android.telephony", "high", mapOf("state" to state, "number" to intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER).orEmpty()))
+  }
+
+  private fun publishAndroidEvent(eventType: String, source: String, priority: String, payload: Map<String, Any?>) {
+    val payloadJson = JSONObject()
+    val payloadMap = Arguments.createMap()
+    payload.forEach { (key, value) ->
+      payloadJson.put(key, value)
+      when (value) {
+        null -> payloadMap.putNull(key)
+        is Boolean -> payloadMap.putBoolean(key, value)
+        is Int -> payloadMap.putInt(key, value)
+        is Long -> payloadMap.putDouble(key, value.toDouble())
+        is Double -> payloadMap.putDouble(key, value)
+        is Float -> payloadMap.putDouble(key, value.toDouble())
+        else -> payloadMap.putString(key, value.toString())
+      }
+    }
+    val timestamp = System.currentTimeMillis()
+    JarvisEventBus.emit("android_event", Arguments.createMap().apply {
+      putString("eventType", eventType)
+      putString("source", source)
+      putString("priority", priority)
+      putDouble("timestamp", timestamp.toDouble())
+      putMap("payload", payloadMap)
+    })
+    socket?.send(JSONObject()
+      .put("type", "android_event")
+      .put("eventType", eventType)
+      .put("source", source)
+      .put("priority", priority)
+      .put("timestamp", timestamp)
+      .put("payload", payloadJson)
+      .toString())
+  }
+
   private fun appLabel(packageName: String): String =
     try {
       val info = packageManager.getApplicationInfo(packageName, 0)
@@ -318,7 +496,6 @@ class JarvisForegroundService : Service() {
     val apps = installedLaunchableApps()
     val visibleLabels = visibleNodeLabels()
     val normalizedQuery = normalizeAppText(query)
-    val aliasPackages = appAliases(normalizedQuery)
     val scored = linkedMapOf<String, JSONObject>()
 
     apps.forEach { app ->
@@ -329,14 +506,9 @@ class JarvisForegroundService : Service() {
       var score = appScore(normalizedQuery, normalizedLabel, normalizedPackage)
       var source = "installed_apps"
 
-      if (aliasPackages.contains(packageName)) {
-        score = maxOf(score, 100)
-        source = "alias"
-      }
-
       if (visibleLabels.any { normalizeAppText(it) == normalizedLabel }) {
         score += 8
-        source = if (source == "alias") "alias+visible_node" else "installed_apps+visible_node"
+        source = "installed_apps+visible_node"
       }
 
       if (score > 0) {
@@ -363,9 +535,6 @@ class JarvisForegroundService : Service() {
   private fun resolveLaunchablePackage(requestedPackage: String): String {
     val requested = requestedPackage.trim()
     if (packageManager.getLaunchIntentForPackage(requested) != null) return requested
-    appAliases(normalizeAppText(requested))
-      .firstOrNull { packageManager.getLaunchIntentForPackage(it) != null }
-      ?.let { return it }
     val normalized = normalizeAppText(requested)
     installedLaunchableApps()
       .maxByOrNull { appScore(normalized, normalizeAppText(it.getString("label")), normalizeAppText(it.getString("packageName"))) }
@@ -398,32 +567,6 @@ class JarvisForegroundService : Service() {
         .forEach(labels::add)
     }
     return labels.toList()
-  }
-
-  private fun appAliases(query: String): List<String> = when (query) {
-    "calculator", "calc", "com calculator" -> listOf(
-      "com.google.android.calculator",
-      "com.android.calculator2",
-      "com.sec.android.app.popupcalculator",
-      "com.miui.calculator",
-      "com.coloros.calculator",
-      "com.oneplus.calculator",
-    )
-    "settings", "android settings" -> listOf("com.android.settings")
-    "whatsapp", "whats app" -> listOf("com.whatsapp")
-    "whatsapp business" -> listOf("com.whatsapp.w4b")
-    "youtube", "yt" -> listOf("com.google.android.youtube")
-    "chrome", "browser" -> listOf("com.android.chrome", "com.google.android.apps.chrome")
-    "maps" -> listOf("com.google.android.apps.maps")
-    "gmail" -> listOf("com.google.android.gm")
-    "photos" -> listOf("com.google.android.apps.photos")
-    "drive" -> listOf("com.google.android.apps.docs")
-    "messages" -> listOf("com.google.android.apps.messaging")
-    "phone", "dialer" -> listOf("com.google.android.dialer")
-    "contacts" -> listOf("com.google.android.contacts")
-    "clock" -> listOf("com.google.android.deskclock")
-    "calendar" -> listOf("com.google.android.calendar")
-    else -> emptyList()
   }
 
   private fun appScore(query: String, label: String, packageName: String): Int {
@@ -470,6 +613,18 @@ class JarvisForegroundService : Service() {
   override fun onDestroy() {
     stopped = true
     reconnect?.let(handler::removeCallbacks)
+    if (systemReceiverRegistered) {
+      runCatching { unregisterReceiver(systemReceiver) }
+      systemReceiverRegistered = false
+    }
+    if (packageReceiverRegistered) {
+      runCatching { unregisterReceiver(packageReceiver) }
+      packageReceiverRegistered = false
+    }
+    clipboardListener?.let { listener ->
+      runCatching { getSystemService(ClipboardManager::class.java).removePrimaryClipChangedListener(listener) }
+      clipboardListener = null
+    }
     socket?.close(1000, "Service stopped")
     socket = null
     if (instance === this) instance = null

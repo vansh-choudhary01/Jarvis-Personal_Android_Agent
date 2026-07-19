@@ -1,14 +1,19 @@
 import {AndroidAgent} from './agent.js';
 import {CapabilityManager} from './capabilityManager.js';
+import {ContextBuilder} from './contextBuilder.js';
 import {EventBus, normalizePhoneMessage, type JarvisEvent} from './eventBus.js';
 import {EventHistory} from './eventHistory.js';
+import {GoalManager} from './goalManager.js';
 import type {LlmRuntime} from './llmRuntime.js';
 import {logEvent} from './logger.js';
+import {MemoryCore} from './memoryCore.js';
 import type {PhoneTransport} from './phoneTransport.js';
 import type {PhoneMessage} from './protocol.js';
 import {RuleEngine, type RuleDecision} from './ruleEngine.js';
+import {ScreenObserver} from './screenObserver.js';
 import {TaskManager} from './taskManager.js';
 import {WorkingMemory} from './workingMemory.js';
+import {WorldStateManager} from './worldState.js';
 
 export interface BrainRuntimeOptions {
   llm: LlmRuntime;
@@ -22,7 +27,11 @@ export interface BrainStatus {
   llmProvider: string;
   llmModel: string;
   workingMemory: ReturnType<WorkingMemory['snapshot']>;
+  worldState: ReturnType<WorldStateManager['snapshot']>;
+  lastPlannerContext: ReturnType<TaskManager['getLastPlannerContext']>;
   recentEvents: ReturnType<EventHistory['recent']>;
+  memoryCandidates: ReturnType<MemoryCore['snapshot']>;
+  goals: ReturnType<GoalManager['snapshot']>;
 }
 
 /**
@@ -39,6 +48,11 @@ export class BrainRuntime {
   private readonly ruleEngine = new RuleEngine();
   private readonly eventHistory = new EventHistory();
   private readonly workingMemory = new WorkingMemory();
+  private readonly worldState = new WorldStateManager();
+  private readonly screenObserver = new ScreenObserver();
+  private readonly contextBuilder = new ContextBuilder();
+  private readonly memory = new MemoryCore();
+  private readonly goals = new GoalManager();
   private readonly capabilityManager = new CapabilityManager();
   private readonly eventDecisions = new Map<string, RuleDecision>();
   private running = false;
@@ -48,6 +62,10 @@ export class BrainRuntime {
     this.manager = new TaskManager(new AndroidAgent(options.llm), {
       eventBus: this.eventBus,
       capabilityManager: this.capabilityManager,
+      contextBuilder: this.contextBuilder,
+      worldState: this.worldState,
+      workingMemory: this.workingMemory,
+      eventHistory: this.eventHistory,
     });
     if (options.phone) this.attachPhone(options.phone);
   }
@@ -67,6 +85,7 @@ export class BrainRuntime {
 
   async submitTask(instruction: string): Promise<string> {
     if (!this.running) this.start();
+    this.goals.createGoal(instruction, 'developer.task');
     this.publishEvent({
       type: 'developer.task_submitted',
       source: 'developer.ui',
@@ -77,7 +96,8 @@ export class BrainRuntime {
   }
 
   async receivePhoneMessage(message: PhoneMessage): Promise<void> {
-    const decisions = normalizePhoneMessage(message).map(draft => this.publishEvent(draft));
+    const screenModel = message.type === 'screen_state' ? this.screenObserver.observe(message) : undefined;
+    const decisions = normalizePhoneMessage(message, screenModel).map(draft => this.publishEvent(draft));
     const shouldProcess = decisions.some(({decision}) => decision.action === 'allow');
     if (!shouldProcess) return;
 
@@ -96,7 +116,11 @@ export class BrainRuntime {
       llmProvider: this.options.llm.provider,
       llmModel: this.options.llm.model,
       workingMemory: this.workingMemory.snapshot(),
+      worldState: this.worldState.snapshot(),
+      lastPlannerContext: this.manager.getLastPlannerContext(),
       recentEvents: this.eventHistory.recent(40),
+      memoryCandidates: this.memory.snapshot(),
+      goals: this.goals.snapshot(),
     };
   }
 
@@ -115,6 +139,8 @@ export class BrainRuntime {
     }
     this.eventHistory.record(event, decision);
     this.workingMemory.observe(event);
+    this.worldState.observe(event);
+    this.memory.observe(event);
     logEvent({
       kind: 'event',
       eventType: event.type,

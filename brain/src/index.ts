@@ -73,7 +73,11 @@ const server = createServer(async (request, response) => {
       phoneConnected: status.phoneConnected,
       activeTask: status.activeTask?.id ?? null,
       workingMemory: status.workingMemory,
+      worldState: status.worldState,
+      lastPlannerContext: status.lastPlannerContext,
       recentEvents: status.recentEvents,
+      memoryCandidates: status.memoryCandidates,
+      goals: status.goals,
     });
     return;
   }

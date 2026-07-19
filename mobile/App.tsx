@@ -57,6 +57,10 @@ const emptyStatus: PermissionStatus = {
   callLog: false,
   sms: false,
   callPhone: false,
+  phoneState: false,
+  bluetooth: Number(Platform.Version) < 31,
+  networkState: true,
+  clipboard: true,
   postNotifications: Number(Platform.Version) < 33,
 };
 
@@ -123,6 +127,18 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
   }, [refresh]);
 
   const ready = useMemo(() => Object.values(permissions).every(Boolean), [permissions]);
+  const callSmsMissing = useMemo(() => missingLabels([
+    ['Call log', permissions.callLog],
+    ['SMS', permissions.sms],
+    ['Phone state', permissions.phoneState],
+    ['Call phone', permissions.callPhone],
+    ['Post notifications', permissions.postNotifications],
+  ]), [permissions]);
+  const wirelessMissing = useMemo(() => missingLabels([
+    ['Bluetooth', permissions.bluetooth],
+    ['WiFi/network', permissions.networkState],
+    ['Clipboard', permissions.clipboard],
+  ]), [permissions]);
 
   useEffect(() => {
     if (!ready || started.current) return;
@@ -139,8 +155,10 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
       PermissionsAndroid.PERMISSIONS.READ_SMS,
       PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
       PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+      PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
     ];
     if (Number(Platform.Version) >= 33) requested.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    if (Number(Platform.Version) >= 31) requested.push('android.permission.BLUETOOTH_CONNECT' as never);
     await PermissionsAndroid.requestMultiple(requested);
     await refresh();
   };
@@ -190,12 +208,19 @@ function Onboarding({devMode, onTitlePress}: OnboardingProps): React.JSX.Element
           <ChecklistRow
             number="03"
             title="Call, SMS, and alerts"
-            detail="Grant call-log, SMS, calling, and notification permissions."
-            complete={permissions.callLog && permissions.sms && permissions.callPhone && permissions.postNotifications}
+            detail={callSmsMissing || 'Call-log, SMS, phone-state, calling, and notification permissions are ready.'}
+            complete={permissions.callLog && permissions.sms && permissions.callPhone && permissions.phoneState && permissions.postNotifications}
             onPress={requestRuntimePermissions}
           />
           <ChecklistRow
             number="04"
+            title="Wireless event router"
+            detail={wirelessMissing || 'Bluetooth, WiFi/network, and clipboard event observation are ready.'}
+            complete={permissions.bluetooth && permissions.networkState && permissions.clipboard}
+            onPress={requestRuntimePermissions}
+          />
+          <ChecklistRow
+            number="05"
             title="Battery exemption"
             detail="Choose Jarvis and allow unrestricted background use."
             complete={permissions.batteryExempt}
@@ -801,6 +826,11 @@ function formatBytes(bytes: number): string {
   const gb = bytes / 1024 / 1024 / 1024;
   if (gb >= 1) return `${gb.toFixed(1)} GB`;
   return `${Math.round(bytes / 1024 / 1024)} MB`;
+}
+
+function missingLabels(items: Array<[string, boolean]>): string {
+  const missing = items.filter(([, ready]) => !ready).map(([label]) => label);
+  return missing.length ? `Missing: ${missing.join(', ')}` : '';
 }
 
 function DevScreen({connection, permissions}: {connection: string; permissions: PermissionStatus}): React.JSX.Element {

@@ -1,4 +1,5 @@
 import {z} from 'zod';
+import {JARVIS_EVENT_TYPES, type JarvisEventPriority} from './eventBus.js';
 
 const nodeSchema = z.object({
   text: z.string().optional().default(''),
@@ -31,6 +32,14 @@ export const phoneMessageSchema = z.discriminatedUnion('type', [
     sender: z.string(),
     body: z.string(),
     timestamp: z.number(),
+  }),
+  z.object({
+    type: z.literal('android_event'),
+    eventType: z.enum(JARVIS_EVENT_TYPES),
+    source: z.string(),
+    priority: z.enum(['low', 'normal', 'high', 'critical']).transform(value => value as JarvisEventPriority),
+    timestamp: z.number(),
+    payload: z.record(z.string(), z.unknown()).default({}),
   }),
   z.object({
     type: z.literal('device_observation'),

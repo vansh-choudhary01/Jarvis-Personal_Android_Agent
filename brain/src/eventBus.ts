@@ -1,32 +1,55 @@
 import type {PhoneMessage, ScreenState} from './protocol.js';
+import type {ScreenModel} from './screenObserver.js';
 
 export type JarvisEventPriority = 'low' | 'normal' | 'high' | 'critical';
 
-export type JarvisEventType =
-  | 'developer.task_submitted'
-  | 'screen.state'
-  | 'notification.received'
-  | 'sms.received'
-  | 'device.observation'
-  | 'foreground_app.changed'
-  | 'accessibility.ui_changed'
-  | 'accessibility.screen_activity'
-  | 'user.interaction'
-  | 'task.started'
-  | 'task.status'
-  | 'task.completed'
-  | 'task.failed'
-  | 'task.blocked'
-  | 'task.cancelled'
-  | 'planner.requested'
-  | 'planner.action_selected'
-  | 'executor.action_started'
-  | 'executor.action_result'
-  | 'capability.check'
-  | 'capability.unavailable'
-  | 'memory.context_requested'
-  | 'memory.context_returned'
-  | 'system.error';
+export const JARVIS_EVENT_TYPES = [
+  'developer.task_submitted',
+  'screen.state',
+  'notification.received',
+  'notification.removed',
+  'sms.received',
+  'call.incoming',
+  'call.missed',
+  'call.ended',
+  'battery.changed',
+  'battery.low',
+  'charging.started',
+  'charging.stopped',
+  'bluetooth.connected',
+  'bluetooth.disconnected',
+  'wifi.connected',
+  'wifi.lost',
+  'clipboard.changed',
+  'package.installed',
+  'package.removed',
+  'screen.locked',
+  'screen.unlocked',
+  'wake_word.detected',
+  'voice.instruction_received',
+  'device.observation',
+  'foreground_app.changed',
+  'accessibility.ui_changed',
+  'accessibility.screen_activity',
+  'user.interaction',
+  'task.started',
+  'task.status',
+  'task.completed',
+  'task.failed',
+  'task.blocked',
+  'task.cancelled',
+  'planner.requested',
+  'planner.action_selected',
+  'executor.action_started',
+  'executor.action_result',
+  'capability.check',
+  'capability.unavailable',
+  'memory.context_requested',
+  'memory.context_returned',
+  'system.error',
+] as const;
+
+export type JarvisEventType = (typeof JARVIS_EVENT_TYPES)[number];
 
 export interface JarvisEvent<TPayload = Record<string, unknown>> {
   id: string;
@@ -102,8 +125,18 @@ export class EventBus {
   }
 }
 
-export function normalizePhoneMessage(message: PhoneMessage): JarvisEventDraft[] {
-  if (message.type === 'screen_state') return [normalizeScreenState(message)];
+export function normalizePhoneMessage(message: PhoneMessage, screenModel?: ScreenModel): JarvisEventDraft[] {
+  if (message.type === 'screen_state') return [normalizeScreenState(message, screenModel)];
+
+  if (message.type === 'android_event') {
+    return [{
+      type: message.eventType,
+      source: message.source,
+      timestamp: message.timestamp,
+      priority: message.priority,
+      payload: message.payload,
+    }];
+  }
 
   if (message.type === 'notification') {
     return [{
@@ -160,7 +193,7 @@ export function normalizePhoneMessage(message: PhoneMessage): JarvisEventDraft[]
   return [{...base, type: 'device.observation', priority: 'low'}];
 }
 
-function normalizeScreenState(screen: ScreenState): JarvisEventDraft {
+function normalizeScreenState(screen: ScreenState, screenModel?: ScreenModel): JarvisEventDraft {
   return {
     type: 'screen.state',
     source: 'android.accessibility',
@@ -174,6 +207,7 @@ function normalizeScreenState(screen: ScreenState): JarvisEventDraft {
         .map(node => `${node.text || ''}|${node.contentDescription || ''}`)
         .join('~')
         .slice(0, 1200),
+      screenModel,
     },
   };
 }

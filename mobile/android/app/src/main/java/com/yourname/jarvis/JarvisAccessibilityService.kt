@@ -5,9 +5,10 @@ import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.WindowManager
+import android.view.accessibility.AccessibilityWindowInfo
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -52,7 +53,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     return latestTree
   }
 
-  fun currentPackageName(): String = rootInActiveWindow?.packageName?.toString().orEmpty()
+  fun currentPackageName(): String = activeContentRoot()?.packageName?.toString().orEmpty()
 
   fun tap(x: Int, y: Int, callback: (Boolean) -> Unit) {
     dispatch(Path().apply { moveTo(x.toFloat(), y.toFloat()) }, 1L, 80L, callback)
@@ -76,7 +77,7 @@ class JarvisAccessibilityService : AccessibilityService() {
   }
 
   fun findAndTap(targetText: String, callback: (Boolean) -> Unit) {
-    val match = rootInActiveWindow?.findAccessibilityNodeInfosByText(targetText)?.firstOrNull {
+    val match = activeContentRoot()?.findAccessibilityNodeInfosByText(targetText)?.firstOrNull {
       val shown = it.text?.toString() ?: it.contentDescription?.toString().orEmpty()
       shown.contains(targetText, ignoreCase = true)
     }
@@ -132,6 +133,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             eventTypeName(event.eventType),
             now,
           )
+          JarvisForegroundService.instance?.onAccessibilityChanged()
         }
       }
       AccessibilityEvent.TYPE_VIEW_CLICKED,
@@ -158,6 +160,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             eventTypeName(event.eventType),
             now,
           )
+          JarvisForegroundService.instance?.onAccessibilityChanged()
         }
       }
     }
@@ -174,8 +177,26 @@ class JarvisAccessibilityService : AccessibilityService() {
 
   private fun refreshTree() {
     val nodes = JSONArray()
-    walk(rootInActiveWindow, nodes, 0)
+    walk(activeContentRoot(), nodes, 0)
     latestTree = nodes.toString()
+  }
+
+  private fun activeContentRoot(): AccessibilityNodeInfo? {
+    val ownPackage = applicationContext.packageName
+    val orderedWindows = windows.orEmpty()
+      .sortedWith(
+        compareByDescending<AccessibilityWindowInfo> { it.isActive }
+          .thenByDescending { it.isFocused },
+      )
+
+    return orderedWindows
+      .mapNotNull { runCatching { it.root }.getOrNull() }
+      .firstOrNull { root ->
+        val packageName = root.packageName?.toString().orEmpty()
+        packageName.isNotBlank() && packageName != ownPackage
+      }
+      ?: rootInActiveWindow
+      ?: orderedWindows.mapNotNull { runCatching { it.root }.getOrNull() }.firstOrNull()
   }
 
   private fun walk(node: AccessibilityNodeInfo?, output: JSONArray, depth: Int) {

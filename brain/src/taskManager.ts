@@ -1,9 +1,13 @@
 import {AndroidAgent, type HistoryStep} from './agent.js';
 import type {CapabilityManager} from './capabilityManager.js';
+import type {ContextBuilder, PlannerContext} from './contextBuilder.js';
 import type {EventBus, JarvisEventPriority, JarvisEventType} from './eventBus.js';
+import type {EventHistory} from './eventHistory.js';
 import {logEvent} from './logger.js';
 import type {AgentAction, BrainMessage, ScreenState} from './protocol.js';
 import type {PhoneTransport} from './phoneTransport.js';
+import type {WorkingMemory} from './workingMemory.js';
+import type {WorldStateManager} from './worldState.js';
 
 export type TaskState = 'queued' | 'running' | 'waiting' | 'paused' | 'blocked' | 'completed' | 'failed' | 'cancelled';
 
@@ -22,12 +26,17 @@ export class TaskManager {
   private phone: PhoneTransport | null = null;
   private task: ActiveTask | null = null;
   private recentPhoneEvents: Record<string, unknown>[] = [];
+  private lastPlannerContext: PlannerContext | null = null;
 
   constructor(
     private readonly agent: AndroidAgent,
     private readonly options: {
       eventBus?: EventBus;
       capabilityManager?: CapabilityManager;
+      contextBuilder?: ContextBuilder;
+      worldState?: WorldStateManager;
+      workingMemory?: WorkingMemory;
+      eventHistory?: EventHistory;
     } = {},
   ) {}
 
@@ -47,6 +56,10 @@ export class TaskManager {
 
   getTask(): Readonly<ActiveTask> | null {
     return this.task;
+  }
+
+  getLastPlannerContext(): PlannerContext | null {
+    return this.lastPlannerContext ? JSON.parse(JSON.stringify(this.lastPlannerContext)) as PlannerContext : null;
   }
 
   async startTask(instruction: string): Promise<string> {
@@ -102,11 +115,14 @@ export class TaskManager {
         packageName: screen.packageName,
         historyLength: task.history.length,
       }, 'normal', task.id);
+      const plannerContext = this.buildPlannerContext(task.instruction);
+      this.lastPlannerContext = plannerContext;
       const action = await this.agent.nextAction(
         task.instruction,
         screen,
         task.history,
         this.recentPhoneEvents.slice(-30),
+        plannerContext,
       );
       const actionJson = JSON.stringify(action);
       const repeatedThreeTimes =
@@ -214,6 +230,18 @@ export class TaskManager {
     correlationId?: string,
   ): void {
     this.options.eventBus?.publish({type, source, payload, priority, correlationId});
+  }
+
+  private buildPlannerContext(instruction: string): PlannerContext | null {
+    if (!this.options.contextBuilder || !this.options.worldState || !this.options.workingMemory || !this.options.eventHistory) {
+      return null;
+    }
+    return this.options.contextBuilder.build({
+      task: instruction,
+      worldState: this.options.worldState.snapshot(),
+      workingMemory: this.options.workingMemory.snapshot(),
+      recentEvents: this.options.eventHistory.recent(80),
+    });
   }
 
   private send(message: BrainMessage): void {
