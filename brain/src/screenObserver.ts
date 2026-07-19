@@ -24,6 +24,8 @@ export interface ScreenModel {
 
 export class ScreenObserver {
   observe(screen: ScreenState): ScreenModel {
+    // Normalize raw Accessibility nodes here so planners can reason about
+    // screens, controls, and state without learning Android's tree format.
     const textNodes = screen.nodeTree
       .map(node => ({
         label: cleanLabel(node.text || node.contentDescription || ''),

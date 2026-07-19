@@ -3,6 +3,8 @@ import type {ScreenModel} from './screenObserver.js';
 
 export type JarvisEventPriority = 'low' | 'normal' | 'high' | 'critical';
 
+// Keep event names centralized so future Android subsystems and plugins extend
+// the same vocabulary instead of inventing planner-specific side channels.
 export const JARVIS_EVENT_TYPES = [
   'developer.task_submitted',
   'screen.state',

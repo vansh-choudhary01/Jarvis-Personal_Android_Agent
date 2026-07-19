@@ -679,6 +679,8 @@ function buildLocalPlannerPrompt(request: {system: string; prompt: string}): str
   const screen = payload.currentScreenState ?? {};
   const history = compactJson(payload.recentHistory, 360);
   const events = compactJson(payload.recentPhoneEvents, 360);
+  // Local models are prompt-sensitive; keep this input semantic and compact so
+  // the embedded path follows the same ScreenModel/ContextBuilder boundary.
   const plannerContext = compactJson(payload.plannerContext, 1200);
   const packageName = safeText(screen.packageName, 90) || 'unknown';
   const lastActionResult = safeText(screen.lastActionResult, 220) || 'none';
